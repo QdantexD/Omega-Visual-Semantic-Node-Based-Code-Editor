@@ -1,4 +1,6 @@
-from typing import Dict, List, Tuple, Any
+from typing import Dict, List, Any
+from .node_item import NodeItem
+from .connection_item import ConnectionItem
 
 
 class GraphRuntime:
@@ -12,7 +14,7 @@ class GraphRuntime:
 
     def __init__(self, view=None):
         self.view = view
-        self._connections: List[Tuple[Any, Any, str, str]] = []
+        self._connections: List[ConnectionItem] = []
 
     def rebuild_from_view(self):
         """Reconstruye el mapa de conexiones a partir de `view.connections`."""
@@ -22,7 +24,7 @@ class GraphRuntime:
         try:
             for c in getattr(self.view, 'connections', []) or []:
                 if getattr(c, 'start_item', None) and getattr(c, 'end_item', None):
-                    self._connections.append((c.start_item, c.end_item, getattr(c, 'start_port', 'output'), getattr(c, 'end_port', 'input')))
+                    self._connections.append(c)
         except Exception:
             pass
 
@@ -36,9 +38,9 @@ class GraphRuntime:
         if not self.view:
             return
 
-        # Recolectar nodos
+        # Recolectar nodos: sólo instancias de NodeItem para evitar introspección costosa
         try:
-            nodes = [it for it in self.view._scene.items() if hasattr(it, 'compute_output_values')]
+            nodes = [it for it in self.view._scene.items() if isinstance(it, NodeItem)]
         except Exception:
             nodes = []
 
@@ -74,23 +76,23 @@ class GraphRuntime:
 
             # Propagar por las conexiones
             changed = False
-            for start, end, start_port, end_port in list(self._connections):
+            for conn in list(self._connections):
                 try:
+                    start = getattr(conn, 'start_item', None)
+                    end = getattr(conn, 'end_item', None)
+                    start_port = getattr(conn, 'start_port', 'output')
+                    end_port = getattr(conn, 'end_port', 'input')
                     val = None
                     if hasattr(start, 'output_values'):
                         val = (start.output_values or {}).get(start_port, None)
                     # Si no hay output_values, usar contenido como fallback
                     if val is None and hasattr(start, 'to_plain_text'):
                         val = start.to_plain_text()
-                    # Entregar al destino (combinando si el destino es un nodo 'output')
+                    # Entregar al destino aplicando la lógica del conector
                     if hasattr(end, 'receive_input_value'):
                         prev = (end.input_values or {}).get(end_port, None)
-                        # Para nodos Output, NO acumular historial: tomar siempre el último valor
                         try:
-                            if str(getattr(end, 'node_type', '')).lower() == 'output':
-                                new_val = val
-                            else:
-                                new_val = val
+                            new_val = conn.apply_logic(prev, val) if hasattr(conn, 'apply_logic') else val
                         except Exception:
                             new_val = val
                         end.receive_input_value(end_port, new_val)

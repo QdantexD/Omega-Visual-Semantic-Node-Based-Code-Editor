@@ -15,6 +15,8 @@ class LineNumberArea(QWidget):
 class TextEditor(QPlainTextEdit):
     def __init__(self):
         super().__init__()
+        # Flag anti-reentrancia para el pintado de números de línea
+        self._painting_line_numbers = False
         # Fuente monoespaciada para código
         font = QFont("Courier", 11)
         font.setStyleHint(QFont.Monospace)
@@ -73,23 +75,35 @@ class TextEditor(QPlainTextEdit):
         self.lineNumberArea.setGeometry(cr.left(), cr.top(), self.lineNumberAreaWidth(), cr.height())
 
     def lineNumberAreaPaintEvent(self, event):
+        # Evitar reentrancia: si ya estamos pintando, salimos
+        if getattr(self, '_painting_line_numbers', False):
+            return
+        self._painting_line_numbers = True
         painter = QPainter(self.lineNumberArea)
-        # Fondo de números de línea más oscuro
-        painter.fillRect(event.rect(), QColor("#0b1220"))
-        block = self.firstVisibleBlock()
-        blockNumber = block.blockNumber()
-        top = self.blockBoundingGeometry(block).translated(self.contentOffset()).top()
-        bottom = top + self.blockBoundingRect(block).height()
-        while block.isValid() and top <= event.rect().bottom():
-            if block.isVisible() and bottom >= event.rect().top():
-                number = str(blockNumber + 1)
-                # Color de texto de números de línea más sobrio
-                painter.setPen(QColor("#64748b"))
-                painter.drawText(0, int(top), int(self.lineNumberArea.width()) - 6, int(self.fontMetrics().height()), Qt.AlignRight, number)
-            block = block.next()
-            top = bottom
+        try:
+            # Fondo de números de línea más oscuro
+            painter.fillRect(event.rect(), QColor("#0b1220"))
+            block = self.firstVisibleBlock()
+            blockNumber = block.blockNumber()
+            top = self.blockBoundingGeometry(block).translated(self.contentOffset()).top()
             bottom = top + self.blockBoundingRect(block).height()
-            blockNumber += 1
+            while block.isValid() and top <= event.rect().bottom():
+                if block.isVisible() and bottom >= event.rect().top():
+                    number = str(blockNumber + 1)
+                    # Color de texto de números de línea más sobrio
+                    painter.setPen(QColor("#64748b"))
+                    painter.drawText(0, int(top), int(self.lineNumberArea.width()) - 6, int(self.fontMetrics().height()), Qt.AlignRight, number)
+                block = block.next()
+                top = bottom
+                bottom = top + self.blockBoundingRect(block).height()
+                blockNumber += 1
+        finally:
+            # Asegurar que no queden dos QPainter activos sobre el mismo dispositivo
+            try:
+                painter.end()
+            except Exception:
+                pass
+            self._painting_line_numbers = False
 
     def highlightCurrentLine(self):
         selections = []

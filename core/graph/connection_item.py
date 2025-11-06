@@ -2,6 +2,7 @@ from PySide6.QtWidgets import QGraphicsPathItem, QGraphicsItem
 from PySide6.QtGui import QPen, QColor, QPainterPath, QBrush, QLinearGradient
 from PySide6.QtCore import QPointF, QRectF, Qt
 import math
+from .connection_logic import get_logic
 
 class ConnectionItem(QGraphicsPathItem):
     """Item gráfico para conexiones entre nodos con curvas bezier."""
@@ -12,11 +13,18 @@ class ConnectionItem(QGraphicsPathItem):
         self.end_item = end_item
         self.start_port = start_port
         self.end_port = end_port
+        # Lógica del conector (combinación de valores) configurable
+        # Blender‑like: por defecto 'passthrough' salvo que el puerto IN acepte múltiples (multi)
+        self.logic_name = "passthrough"
+        self.logic_config = {"delimiter": "\n"}
         self._temp_end_pos = None  # posición temporal mientras se arrastra
         
         # Configuración visual (neón elegante/profesional)
-        self._neon_color = QColor(0, 240, 255)        # cian neón suave
-        self._neon_core = QColor(30, 200, 220)        # núcleo discreto
+        # Paletas por tipo de conexión (data vs exec)
+        self._neon_color = QColor(0, 240, 255)        # cian neón suave (data)
+        self._neon_core = QColor(30, 200, 220)        # núcleo discreto (data)
+        self._exec_neon_color = QColor(229, 231, 235) # gris claro (exec)
+        self._exec_neon_core = QColor(250, 250, 250)  # blanco sutil (exec)
         self._cp_magenta = QColor(255, 0, 204)
         self._cp_cyan = QColor(0, 234, 255)
         self._cp_yellow = QColor(255, 239, 0)
@@ -25,6 +33,11 @@ class ConnectionItem(QGraphicsPathItem):
         self._glow_alpha_soft = 70
         self.pen = QPen(self._neon_core)
         self.pen.setWidth(2)
+        # Ajustar lógica por defecto según tipo y destino
+        try:
+            self._update_logic_default()
+        except Exception:
+            pass
         self.setPen(self.pen)
         
         # Habilitar selección sólo con botón derecho; no interferir con arrastre del nodo
@@ -52,6 +65,14 @@ class ConnectionItem(QGraphicsPathItem):
 
         self.update_path()
 
+    # --- Lógica de combinación aplicada en runtime ---
+    def apply_logic(self, prev_value, incoming_value):
+        try:
+            logic = get_logic(self.logic_name)
+            return logic.combine(prev_value, incoming_value, self.logic_config)
+        except Exception:
+            return incoming_value
+
     def set_temp_end(self, pos: QPointF):
         """Establece una posición temporal de final mientras se arrastra."""
         self._temp_end_pos = pos
@@ -74,6 +95,11 @@ class ConnectionItem(QGraphicsPathItem):
     
     def update_path(self):
         """Actualiza la ruta de la conexión."""
+        # Recalcular la lógica por defecto al actualizar (por si cambió el destino durante el arrastre)
+        try:
+            self._update_logic_default()
+        except Exception:
+            pass
         if not self.start_item:
             return
             
@@ -133,6 +159,11 @@ class ConnectionItem(QGraphicsPathItem):
     def finalize_end(self):
         """Limpia el estado temporal una vez fijado el nodo destino."""
         self._temp_end_pos = None
+        # Reajustar lógica por defecto ahora que hay destino final
+        try:
+            self._update_logic_default()
+        except Exception:
+            pass
     
     def shape(self):
         """Define la forma de hit más estrecha para evitar capturar clics sobre nodos."""
@@ -151,6 +182,11 @@ class ConnectionItem(QGraphicsPathItem):
         path = self.path()
         start_pos = path.pointAtPercent(0)
         end_pos = path.pointAtPercent(1)
+
+        # Seleccionar paleta según tipo de conexión
+        kind = self._connection_kind()
+        neon_color = self._exec_neon_color if kind == "exec" else self._neon_color
+        neon_core = self._exec_neon_core if kind == "exec" else self._neon_core
 
         # Brillo (glow) bajo la línea con flicker sutil
         painter.save()
@@ -173,11 +209,11 @@ class ConnectionItem(QGraphicsPathItem):
             painter.setPen(glow_pen_strong)
             painter.drawPath(path)
         else:
-            glow_pen_soft = QPen(QColor(self._neon_color.red(), self._neon_color.green(), self._neon_color.blue(), soft_alpha))
+            glow_pen_soft = QPen(QColor(neon_color.red(), neon_color.green(), neon_color.blue(), soft_alpha))
             glow_pen_soft.setWidth(8)
             painter.setPen(glow_pen_soft)
             painter.drawPath(path)
-            glow_pen_strong = QPen(QColor(self._neon_color.red(), self._neon_color.green(), self._neon_color.blue(), strong_alpha))
+            glow_pen_strong = QPen(QColor(neon_color.red(), neon_color.green(), neon_color.blue(), strong_alpha))
             glow_pen_strong.setWidth(5)
             painter.setPen(glow_pen_strong)
             painter.drawPath(path)
@@ -189,7 +225,7 @@ class ConnectionItem(QGraphicsPathItem):
             core_width = 3
             line_style = Qt.SolidLine
         else:
-            core_color = self._neon_core
+            core_color = neon_core
             core_width = 2
             # Durante arrastre mostrar línea discontinua animada
             line_style = Qt.SolidLine if self.end_item is not None else Qt.DashLine
@@ -197,7 +233,7 @@ class ConnectionItem(QGraphicsPathItem):
         # Núcleo limpio (sin gradiente) para mayor elegancia
         self.pen.setWidth(core_width)
         self.pen.setStyle(line_style)
-        self.pen.setColor(core_color if self.isSelected() else self._neon_core)
+        self.pen.setColor(core_color if self.isSelected() else neon_core)
         if line_style == Qt.DashLine:
             try:
                 self.pen.setDashPattern([8, 6])
@@ -243,3 +279,53 @@ class ConnectionItem(QGraphicsPathItem):
         if self._shimmer_offset > 1000.0:
             self._shimmer_offset = 0.0
         self.update()
+    def _get_port_kind(self, item, port_name: str, port_type: str) -> str:
+        """Resuelve el 'kind' del puerto ('exec'|'data') en el item indicado."""
+        try:
+            ports = item.output_ports if port_type == "output" else item.input_ports
+            for p in ports:
+                if str(p.get("name")) == str(port_name):
+                    kind = str(p.get("kind", "data")).lower()
+                    if kind in ("exec", "data"):
+                        return kind
+                    break
+        except Exception:
+            pass
+        # Heurística por nombre
+        try:
+            return "exec" if "exec" in str(port_name).lower() else "data"
+        except Exception:
+            return "data"
+
+    def _connection_kind(self) -> str:
+        """Determina si la conexión es de tipo exec o data."""
+        try:
+            start_kind = self._get_port_kind(self.start_item, self.start_port, "output") if self.start_item else "data"
+        except Exception:
+            start_kind = "data"
+        try:
+            end_kind = self._get_port_kind(self.end_item, self.end_port, "input") if self.end_item else None
+        except Exception:
+            end_kind = None
+        return "exec" if (start_kind == "exec" or end_kind == "exec") else "data"
+
+    # --- Selección de lógica por defecto ---
+    def _is_end_input_multi(self) -> bool:
+        try:
+            if self.end_item is None:
+                return False
+            ports = getattr(self.end_item, 'input_ports', []) or []
+            for p in ports:
+                if str(p.get('name')) == str(self.end_port):
+                    return bool(p.get('multi', False)) or str(getattr(self.end_item, 'node_type', '')).lower() == 'output'
+        except Exception:
+            pass
+        return False
+
+    def _update_logic_default(self) -> None:
+        kind = self._connection_kind()
+        if kind == 'exec':
+            self.logic_name = 'passthrough'
+            return
+        # data connection
+        self.logic_name = 'list' if self._is_end_input_multi() else 'passthrough'

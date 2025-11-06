@@ -12,6 +12,7 @@ from ..nodes.variable_node import VariableNode
 from ..library.variable_library import variable_library
 from ..library.cpp_builtins_catalog import get_cpp_catalog
 from .runtime import GraphRuntime
+from .node_model import NodeModel, project_to_dict, project_from_dict
 
 logger = logging.getLogger("core.node_view")
 
@@ -48,11 +49,11 @@ class NodeView(QGraphicsView):
         self.setRenderHint(QPainter.Antialiasing, True)
         self.setRenderHint(QPainter.SmoothPixmapTransform, True)
         self.setRenderHint(QPainter.TextAntialiasing, True)
-        # Actualización de viewport completa (evita frames residuales/jitter)
-        self.setViewportUpdateMode(QGraphicsView.FullViewportUpdate)
-        # Viewport opaco para que no se mezclen frames anteriores
+        # Modo de actualización conservador para evitar repintados reentrantes
+        self.setViewportUpdateMode(QGraphicsView.MinimalViewportUpdate)
+        # Evitar forzar WA_OpaquePaintEvent que puede chocar con algunos drivers
         try:
-            self.viewport().setAttribute(Qt.WA_OpaquePaintEvent, True)
+            self.viewport().setAttribute(Qt.WA_OpaquePaintEvent, False)
         except Exception:
             pass
         # Sin cache global para el fondo; preferimos repintado limpio
@@ -61,7 +62,8 @@ class NodeView(QGraphicsView):
         except Exception:
             pass
         self.setOptimizationFlag(QGraphicsView.DontAdjustForAntialiasing, True)
-        self.setOptimizationFlag(QGraphicsView.DontSavePainterState, True)
+        # Permitir que Qt gestione el estado del painter para mayor seguridad
+        self.setOptimizationFlag(QGraphicsView.DontSavePainterState, False)
         self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
         # Aceptar arrastrar/soltar (para archivos desde Explorer/OS)
         try:
@@ -81,6 +83,12 @@ class NodeView(QGraphicsView):
         self._scene.setSceneRect(-5000, -5000, 10000, 10000)
         self.setScene(self._scene)
         self._scene.selectionChanged.connect(self._on_scene_selection_changed)
+        # Asegurar que la vista acepte y capture eventos de teclado (TAB)
+        try:
+            self.setFocusPolicy(Qt.StrongFocus)
+            self.setFocus()
+        except Exception:
+            pass
         # Política de scroll al estilo Houdini (sin barras; pan con ratón)
         try:
             self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
@@ -88,7 +96,7 @@ class NodeView(QGraphicsView):
         except Exception:
             pass
         # Configuración de minimapa estilo Houdini (pintado en foreground)
-        self._minimap_enabled = True
+        self._minimap_enabled = False
         self._minimap_size = QSize(180, 130)
         self._minimap_margin = 12
 
@@ -98,6 +106,8 @@ class NodeView(QGraphicsView):
         self._pan_active = False
         self._press_pos = QPoint()
         self._last_mouse_pos = QPoint()
+        # Efectos en nodos: desactivados por defecto para evitar repintados complejos
+        self._node_shadows_enabled = False
 
         # Rubber-band
         self._rubber_band = QRubberBand(QRubberBand.Rectangle, self.viewport())
@@ -110,12 +120,60 @@ class NodeView(QGraphicsView):
         # Hint visual de snap activo
         self._snap_hint_node = None
 
-        # Modo corte (Houdini-style) con tecla Y
+        # Estado de corte y vista previa de conexiones
+        # Inicializados aquí para evitar AttributeError en eventos del mouse
         self._cut_mode = False
         self._cut_path = None
         self._cut_item = None
         # Vista previa de conexión (guía visual entre OUT e IN cercano)
         self._preview_conn_item = None
+
+        # Undo/Redo
+        self._undo_stack = []  # lista de tuplas (undo_fn, redo_fn, label)
+        self._redo_stack = []
+        self._suspend_undo = False  # evita registrar durante ejecución de undo/redo
+
+    def _push_undo(self, undo_fn, redo_fn, label: str = ""):
+        try:
+            if self._suspend_undo:
+                return
+            self._undo_stack.append((undo_fn, redo_fn, label))
+            # Una nueva acción invalida posibles redos
+            self._redo_stack.clear()
+        except Exception:
+            pass
+
+    def undo(self):
+        try:
+            if not self._undo_stack:
+                return
+            entry = self._undo_stack.pop()
+            undo_fn, redo_fn, label = entry
+            self._suspend_undo = True
+            try:
+                undo_fn()
+            finally:
+                self._suspend_undo = False
+            # Permite rehacer lo deshecho
+            self._redo_stack.append((redo_fn, undo_fn, label))
+        except Exception:
+            pass
+
+    def redo(self):
+        try:
+            if not self._redo_stack:
+                return
+            entry = self._redo_stack.pop()
+            redo_fn, undo_fn, label = entry
+            self._suspend_undo = True
+            try:
+                redo_fn()
+            finally:
+                self._suspend_undo = False
+            # Vuelve a permitir deshacer
+            self._undo_stack.append((undo_fn, redo_fn, label))
+        except Exception:
+            pass
 
         # Grid
         self._base_grid = 40
@@ -170,6 +228,39 @@ class NodeView(QGraphicsView):
                     self.add_connection(inp, proc, start_port=(inp.output_ports[0]['name'] if inp.output_ports else 'output'), end_port=(proc.input_ports[0]['name'] if proc.input_ports else 'input'))
                 if proc and out:
                     self.add_connection(proc, out, start_port=(proc.output_ports[0]['name'] if proc.output_ports else 'output'), end_port=(out.input_ports[0]['name'] if out.input_ports else 'input'))
+                # Centrar/encuadrar la vista en los nodos creados tras mostrar el widget
+                try:
+                    if created:
+                        def _fit_created():
+                            try:
+                                combined = created[0].sceneBoundingRect()
+                                for it in created[1:]:
+                                    combined = combined.united(it.sceneBoundingRect())
+                                pad = max(60.0, max(combined.width(), combined.height()) * 0.15)
+                                padded = combined.adjusted(-pad, -pad, pad, pad)
+                                old_anchor = self.transformationAnchor()
+                                self.setTransformationAnchor(QGraphicsView.AnchorViewCenter)
+                                self.fitInView(padded, Qt.KeepAspectRatio)
+                                self.setTransformationAnchor(old_anchor)
+                                self._zoom = 0
+                                try:
+                                    self.zoomChanged.emit(float(self.transform().m11()))
+                                except Exception:
+                                    pass
+                            except Exception:
+                                # Fallback simple: centerOn el promedio
+                                try:
+                                    cx = sum(float(n.scenePos().x()) for n in created) / float(len(created))
+                                    cy = sum(float(n.scenePos().y()) for n in created) / float(len(created))
+                                    self.centerOn(QPointF(cx, cy))
+                                except Exception:
+                                    pass
+                        try:
+                            QTimer.singleShot(120, _fit_created)
+                        except Exception:
+                            _fit_created()
+                except Exception:
+                    pass
             except Exception:
                 pass
         except Exception as e:
@@ -181,10 +272,84 @@ class NodeView(QGraphicsView):
         except Exception as e:
             logger.warning(f"Error evaluando grafo inicial: {e}")
 
+    def ensure_demo_graph(self):
+        """Si la escena está vacía, crea el grafo demo Input->Process->Output y encuadra."""
+        try:
+            existing = [it for it in self._scene.items() if isinstance(it, NodeItem)]
+        except Exception:
+            existing = []
+        if existing:
+            return
+        try:
+            specs = [
+                {"title": "Input", "x": -300, "y": -80, "type": "input", "inputs": [], "outputs": ["output"], "content": "Hola"},
+                {"title": "Process", "x": 40, "y": -20, "type": "process", "inputs": ["input"], "outputs": ["output"], "content": "input.upper()"},
+                {"title": "Output", "x": 320, "y": 70, "type": "output", "inputs": ["input"], "outputs": [], "content": ""},
+            ]
+            created = []
+            for spec in specs:
+                node = self.add_node_with_ports(
+                    title=spec["title"], x=spec["x"], y=spec["y"], node_type=spec["type"],
+                    inputs=spec["inputs"], outputs=spec["outputs"], content=spec.get("content", ""), record_undo=False
+                )
+                if node:
+                    created.append(node)
+            # Conectar
+            try:
+                inp = next((n for n in created if getattr(n, 'node_type', '') == 'input'), None)
+                proc = next((n for n in created if getattr(n, 'node_type', '') == 'process'), None)
+                out = next((n for n in created if getattr(n, 'node_type', '') == 'output'), None)
+                if inp and proc:
+                    self.add_connection(inp, proc, start_port=(inp.output_ports[0]['name'] if inp.output_ports else 'output'), end_port=(proc.input_ports[0]['name'] if proc.input_ports else 'input'), record_undo=False)
+                if proc and out:
+                    self.add_connection(proc, out, start_port=(proc.output_ports[0]['name'] if proc.output_ports else 'output'), end_port=(out.input_ports[0]['name'] if out.input_ports else 'input'), record_undo=False)
+            except Exception:
+                pass
+            # Encadrar
+            try:
+                if created:
+                    combined = created[0].sceneBoundingRect()
+                    for it in created[1:]:
+                        combined = combined.united(it.sceneBoundingRect())
+                    pad = max(60.0, max(combined.width(), combined.height()) * 0.15)
+                    padded = combined.adjusted(-pad, -pad, pad, pad)
+                    old_anchor = self.transformationAnchor()
+                    self.setTransformationAnchor(QGraphicsView.AnchorViewCenter)
+                    self.fitInView(padded, Qt.KeepAspectRatio)
+                    self.setTransformationAnchor(old_anchor)
+                    self._zoom = 0
+                    try:
+                        self.zoomChanged.emit(float(self.transform().m11()))
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            # Evaluar
+            try:
+                self.evaluate_graph()
+            except Exception:
+                pass
+        except Exception:
+            logger.exception("No se pudo asegurar el grafo demo")
+
     # ----------------------
     # Background Grid
     # ----------------------
     def drawBackground(self, painter: QPainter, rect: QRectF):
+        # Asegurar colores/base inicializados aunque drawBackground se invoque temprano
+        try:
+            if not hasattr(self, "_bg_color"):
+                self._bg_color = QColor(30, 32, 36)
+            if not hasattr(self, "_grid_color"):
+                self._grid_color = QColor(68, 72, 80, 80)
+            if not hasattr(self, "_major_grid_color"):
+                self._major_grid_color = QColor(94, 98, 110, 130)
+            if not hasattr(self, "_base_grid"):
+                self._base_grid = 40
+            if not hasattr(self, "_major_factor"):
+                self._major_factor = 4
+        except Exception:
+            pass
         painter.fillRect(rect, self._bg_color)
         grid = float(self._base_grid)
         major = self._major_factor
@@ -251,7 +416,7 @@ class NodeView(QGraphicsView):
             return
         super().wheelEvent(event)
 
-    def add_connection(self, start_item, end_item, start_port="output", end_port="input"):
+    def add_connection(self, start_item, end_item, start_port="output", end_port="input", record_undo: bool = True):
         """Agrega una conexión entre dos nodos."""
         connection = ConnectionItem(start_item, end_item, start_port, end_port)
         self._scene.addItem(connection)
@@ -268,6 +433,17 @@ class NodeView(QGraphicsView):
         except Exception:
             pass
         
+        # Registrar undo/redo
+        try:
+            if record_undo and not self._suspend_undo:
+                self._push_undo(
+                    undo_fn=lambda: self.remove_connection(connection, record_undo=False),
+                    redo_fn=lambda: self.add_connection(start_item, end_item, start_port, end_port, record_undo=False),
+                    label="add_connection"
+                )
+        except Exception:
+            pass
+
         return connection
 
     def _tick_connection_animation(self):
@@ -282,9 +458,20 @@ class NodeView(QGraphicsView):
             # Animación es no-crítica; no bloquear por errores
             pass
 
-    def remove_connection(self, connection):
+    def remove_connection(self, connection, record_undo: bool = True):
         """Elimina una conexión."""
         if connection in self.connections:
+            # Capturar propiedades para rehacer si aplica
+            try:
+                start_item = connection.start_item
+                end_item = connection.end_item
+                start_port = getattr(connection, "start_port", "output")
+                end_port = getattr(connection, "end_port", "input")
+            except Exception:
+                start_item = None
+                end_item = None
+                start_port = "output"
+                end_port = "input"
             self.connections.remove(connection)
             
             # Actualizar nodos
@@ -298,6 +485,16 @@ class NodeView(QGraphicsView):
                 if self._runtime:
                     self._runtime.rebuild_from_view()
                     self._runtime.evaluate_all()
+            except Exception:
+                pass
+            # Registrar undo/redo
+            try:
+                if record_undo and not self._suspend_undo and start_item is not None and end_item is not None:
+                    self._push_undo(
+                        undo_fn=lambda: self.add_connection(start_item, end_item, start_port, end_port, record_undo=False),
+                        redo_fn=lambda: self.remove_connection(next((c for c in self.connections if c.start_item is start_item and c.end_item is end_item and getattr(c, 'start_port', None) == start_port and getattr(c, 'end_port', None) == end_port), connection), record_undo=False),
+                        label="remove_connection"
+                    )
             except Exception:
                 pass
 
@@ -479,6 +676,22 @@ class NodeView(QGraphicsView):
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
+        # Inicialización defensiva de atributos usados por eventos tempranos
+        try:
+            if not hasattr(self, "_cut_mode"):
+                self._cut_mode = False
+            if not hasattr(self, "_cut_item"):
+                self._cut_item = None
+            if not hasattr(self, "_cut_path"):
+                self._cut_path = None
+            if not hasattr(self, "_pending_pan"):
+                self._pending_pan = False
+            if not hasattr(self, "_pan_active"):
+                self._pan_active = False
+            if not hasattr(self, "_rubber_selecting"):
+                self._rubber_selecting = False
+        except Exception:
+            pass
         # Trazo de corte activo: continuar dibujando la línea
         if self._cut_mode and self._cut_item is not None and (event.buttons() & Qt.LeftButton):
             try:
@@ -771,6 +984,15 @@ class NodeView(QGraphicsView):
                             self._runtime.evaluate_all()
                     except Exception:
                         pass
+                    # Registrar undo/redo para la conexión creada manualmente
+                    try:
+                        self._push_undo(
+                            undo_fn=lambda: self.remove_connection(self.connection_in_progress, record_undo=False),
+                            redo_fn=lambda: self.add_connection(self.connection_in_progress.start_item, target, self.connection_in_progress.start_port, end_port, record_undo=False),
+                            label="add_connection"
+                        )
+                    except Exception:
+                        pass
                 else:
                     # Cancelación: restaurar si era rewire, eliminar si era nueva
                     try:
@@ -940,6 +1162,19 @@ class NodeView(QGraphicsView):
     # Node Creation (Tab Menu)
     # ----------------------
     def keyPressEvent(self, event):
+        # Undo/Redo por teclado
+        try:
+            if event.modifiers() & Qt.ControlModifier:
+                if event.key() == Qt.Key_Z:
+                    self.undo()
+                    event.accept()
+                    return
+                if event.key() == Qt.Key_Y or ((event.modifiers() & Qt.ShiftModifier) and event.key() == Qt.Key_Z):
+                    self.redo()
+                    event.accept()
+                    return
+        except Exception:
+            pass
         if event.key() == Qt.Key_Tab:
             # Abrir menú TAB de creación de nodos
             try:
@@ -1066,6 +1301,109 @@ class NodeView(QGraphicsView):
         except Exception:
             logger.exception("Error abriendo última ventana de conexión")
 
+    # API pública para abrir el menú TAB desde otras vistas (barra inferior)
+    def open_tab_menu(self):
+        try:
+            self._show_tab_menu()
+        except Exception:
+            pass
+
+    # Controles de zoom para la barra inferior del editor de nodos
+    def zoom_in(self):
+        try:
+            factor = 1.25
+            new_zoom = self._zoom + 1
+            if -40 <= new_zoom <= 80:
+                self._zoom = new_zoom
+                self.scale(factor, factor)
+                try:
+                    self.zoomChanged.emit(float(self.transform().m11()))
+                except Exception:
+                    pass
+                try:
+                    self._update_minimap_fit()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def zoom_out(self):
+        try:
+            factor = 1 / 1.25
+            new_zoom = self._zoom - 1
+            if -40 <= new_zoom <= 80:
+                self._zoom = new_zoom
+                self.scale(factor, factor)
+                try:
+                    self.zoomChanged.emit(float(self.transform().m11()))
+                except Exception:
+                    pass
+                try:
+                    self._update_minimap_fit()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def reset_zoom(self):
+        try:
+            self.resetTransform()
+            self._zoom = 0
+            try:
+                self.zoomChanged.emit(float(self.transform().m11()))
+            except Exception:
+                pass
+            try:
+                self._update_minimap_fit()
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    # Layout rápido horizontal de la selección actual
+    def auto_layout_selection(self):
+        try:
+            selected_nodes = [it for it in self._scene.selectedItems() if isinstance(it, NodeItem)]
+            if not selected_nodes:
+                return
+            # Ordenar por X y colocar en fila con espaciado
+            selected_nodes.sort(key=lambda n: float(n.x()))
+            start_x = float(selected_nodes[0].x())
+            start_y = float(selected_nodes[0].y())
+            spacing = 220.0
+            for i, n in enumerate(selected_nodes):
+                try:
+                    r = n.rect()
+                    spacing = max(spacing, r.width() + 140.0)
+                except Exception:
+                    pass
+                n.setPos(start_x + i * spacing, start_y)
+            try:
+                self.update_all_connections()
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def delete_selected_nodes(self):
+        try:
+            selected_nodes = [it for it in self._scene.selectedItems() if isinstance(it, NodeItem)]
+            for n in selected_nodes:
+                self.remove_node(n)
+            try:
+                self.update_all_connections()
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def toggle_minimap(self):
+        try:
+            self._minimap_enabled = not bool(getattr(self, '_minimap_enabled', False))
+            self.viewport().update()
+        except Exception:
+            pass
+
     def _show_tab_menu(self):
         menu = QMenu(self)
         # Menú: acciones de generación múltiple al nivel superior
@@ -1092,6 +1430,14 @@ class NodeView(QGraphicsView):
                 cat_menu.addMenu(sub)
             menu.addMenu(cat_menu)
             menu._catalog_action_item_map = action_item_map  # adjuntar tabla para su uso tras exec
+
+        # Submenú Blueprint Base (nodos prefabricados)
+        bp_menu = QMenu("Blueprint Base", menu)
+        bp_menu.addAction("Event")
+        bp_menu.addAction("Branch")
+        bp_menu.addAction("Sequence")
+        bp_menu.addAction("Print")
+        menu.addMenu(bp_menu)
         
         chosen = menu.exec(QCursor.pos())
         if chosen is None:
@@ -1146,6 +1492,78 @@ class NodeView(QGraphicsView):
             except Exception:
                 logger.exception("No se pudieron generar nodos de clases C++ múltiples desde TAB")
             node = None
+        elif action_text == "Event":
+            try:
+                node = self.add_node_with_ports(
+                    title="Event",
+                    x=float(scene_pos.x()),
+                    y=float(scene_pos.y()),
+                    node_type="event",
+                    inputs=[],
+                    outputs=[{"name": "exec", "kind": "exec"}],
+                    content="// Evento base: dispara ejecución"
+                )
+                if node:
+                    for it in self._scene.selectedItems():
+                        it.setSelected(False)
+                    node.setSelected(True)
+                    self.centerOn(node)
+            except Exception:
+                logger.exception("No se pudo crear nodo Event")
+        elif action_text == "Branch":
+            try:
+                node = self.add_node_with_ports(
+                    title="Branch",
+                    x=float(scene_pos.x()),
+                    y=float(scene_pos.y()),
+                    node_type="branch",
+                    inputs=[{"name": "exec", "kind": "exec"}, {"name": "condition"}],
+                    outputs=[{"name": "true", "kind": "exec"}, {"name": "false", "kind": "exec"}],
+                    content="// Branch: enruta ejecución según condición"
+                )
+                if node:
+                    for it in self._scene.selectedItems():
+                        it.setSelected(False)
+                    node.setSelected(True)
+                    self.centerOn(node)
+            except Exception:
+                logger.exception("No se pudo crear nodo Branch")
+        elif action_text == "Sequence":
+            try:
+                node = self.add_node_with_ports(
+                    title="Sequence",
+                    x=float(scene_pos.x()),
+                    y=float(scene_pos.y()),
+                    node_type="sequence",
+                    inputs=[{"name": "exec", "kind": "exec"}],
+                    outputs=[{"name": "A", "kind": "exec"}, {"name": "B", "kind": "exec"}],
+                    content="// Sequence: dispara salidas en orden"
+                )
+                if node:
+                    for it in self._scene.selectedItems():
+                        it.setSelected(False)
+                    node.setSelected(True)
+                    self.centerOn(node)
+            except Exception:
+                logger.exception("No se pudo crear nodo Sequence")
+        elif action_text == "Print":
+            try:
+                node = self.add_node_with_ports(
+                    title="Print",
+                    x=float(scene_pos.x()),
+                    y=float(scene_pos.y()),
+                    node_type="print",
+                    inputs=[{"name": "exec", "kind": "exec"}, {"name": "input"}],
+                    outputs=[{"name": "then", "kind": "exec"}],
+                    content="print(input)"
+                )
+                if node:
+                    for it in self._scene.selectedItems():
+                        it.setSelected(False)
+                    node.setSelected(True)
+                    self.centerOn(node)
+            except Exception:
+                logger.exception("No se pudo crear nodo Print")
         # Opción de enrutamiento eliminada del TAB a petición del usuario
         else:
             return
@@ -1430,6 +1848,15 @@ class NodeView(QGraphicsView):
                     menu.addAction("Marcar como snapshot")
             except Exception:
                 pass
+        # Toggle Blender‑like: mutear nodo para hacer passthrough
+        if single_selected is not None:
+            try:
+                if getattr(single_selected, 'muted', False):
+                    menu.addAction("Quitar mute")
+                else:
+                    menu.addAction("Mutear nodo")
+            except Exception:
+                pass
         # Toggle para reenviar salida desde nodos Output
         if single_selected is not None and str(getattr(single_selected, 'node_type', '')).lower() == 'output':
             try:
@@ -1450,6 +1877,10 @@ class NodeView(QGraphicsView):
         menu.addSeparator()
         menu.addAction("Crear nodo (genérico)")
         menu.addAction("Crear nodo (Combine)")
+        # Nodo especial: Monitor (Output) para reflejar valores en Preview
+        menu.addAction("Crear nodo Monitor (Output)")
+        # Output Global: agrega un Output con múltiples IN y autoconecta fuentes
+        menu.addAction("Crear Output Global (autoconectar)")
         # Acción contextual: generar nodo de programación C++ desde variable cuando el lenguaje activo es C++
         if is_variable_selected:
             try:
@@ -1675,6 +2106,28 @@ class NodeView(QGraphicsView):
                     self.update_all_connections()
                 except Exception:
                     pass
+            elif text == "Mutear nodo":
+                selected_nodes = [it for it in self._scene.selectedItems() if isinstance(it, NodeItem)]
+                for n in selected_nodes:
+                    try:
+                        setattr(n, 'muted', True)
+                    except Exception:
+                        pass
+                try:
+                    self.evaluate_graph()
+                except Exception:
+                    pass
+            elif text == "Quitar mute":
+                selected_nodes = [it for it in self._scene.selectedItems() if isinstance(it, NodeItem)]
+                for n in selected_nodes:
+                    try:
+                        setattr(n, 'muted', False)
+                    except Exception:
+                        pass
+                try:
+                    self.evaluate_graph()
+                except Exception:
+                    pass
             elif text == "Expandir tamaño ×1.25 (seleccionados)":
                 selected_nodes = [it for it in self._scene.selectedItems() if isinstance(it, NodeItem)]
                 for n in selected_nodes:
@@ -1721,6 +2174,63 @@ class NodeView(QGraphicsView):
                 if node:
                     node.setSelected(True)
                     self.centerOn(node)
+            elif text == "Crear nodo Monitor (Output)":
+                scene_pos = self.mapToScene(view_pos)
+                # Crear un nodo de tipo 'output' con entrada 'input' y salida 'output'
+                mon = self.add_node_with_ports("Monitor", scene_pos.x(), scene_pos.y(), node_type="output", inputs=[{"name": "input", "kind": "data", "multi": True}], outputs=["output"], content="")
+                if mon:
+                    try:
+                        # Activar reenvío de salida para poder encadenarlo si se desea
+                        setattr(mon, 'forward_output', True)
+                    except Exception:
+                        pass
+                    # Si hay un único nodo seleccionado, autoconectar su primer OUT al IN del monitor
+                    try:
+                        selected_nodes_ctx = [it for it in self._scene.selectedItems() if isinstance(it, NodeItem)]
+                        if len(selected_nodes_ctx) == 1:
+                            src = selected_nodes_ctx[0]
+                            start_port = (src.output_ports[0]['name'] if getattr(src, 'output_ports', None) else 'output')
+                            end_port = (mon.input_ports[0]['name'] if getattr(mon, 'input_ports', None) else 'input')
+                            self.add_connection(src, mon, start_port=start_port, end_port=end_port)
+                    except Exception:
+                        pass
+                    # Seleccionar y centrar el monitor para feedback visual
+                    try:
+                        mon.setSelected(True)
+                        self.centerOn(mon)
+                    except Exception:
+                        pass
+            elif text == "Crear Output Global (autoconectar)":
+                scene_pos = self.mapToScene(view_pos)
+                # Fuentes: si hay selección, usarla; si no, usar todos los nodos no-Output
+                sources = []
+                try:
+                    selected_nodes_ctx = [it for it in self._scene.selectedItems() if isinstance(it, NodeItem)]
+                    if selected_nodes_ctx:
+                        sources = [n for n in selected_nodes_ctx if str(getattr(n, 'node_type', '')).lower() != 'output']
+                    else:
+                        # Todos los NodeItem de la escena que no sean 'output'
+                        sources = [it for it in self._scene.items() if isinstance(it, NodeItem) and str(getattr(it, 'node_type', '')).lower() != 'output']
+                except Exception:
+                    sources = []
+                # Crear lista de puertos IN: uno por fuente
+                in_names = [f"in{i+1}" for i in range(len(sources))] or ["input"]
+                out_names = ["output"]
+                out_node = self.add_node_with_ports("Output Global", scene_pos.x(), scene_pos.y(), node_type="output", inputs=in_names, outputs=out_names, content="")
+                if out_node:
+                    # Conectar cada fuente a su puerto IN dedicado
+                    for idx, src in enumerate(sources):
+                        try:
+                            start_port = (src.output_ports[0]['name'] if getattr(src, 'output_ports', None) else 'output')
+                            end_port = (out_node.input_ports[idx]['name'] if idx < len(out_node.input_ports) else 'input')
+                            self.add_connection(src, out_node, start_port=start_port, end_port=end_port)
+                        except Exception:
+                            pass
+                    try:
+                        out_node.setSelected(True)
+                        self.centerOn(out_node)
+                    except Exception:
+                        pass
             elif text == "Generar nodo C++ (plantilla)":
                 # Crear un nodo semántico basado en C++ y la variable seleccionada
                 var_node_list = [it for it in self._scene.selectedItems() if isinstance(it, VariableNode)]
@@ -1938,7 +2448,7 @@ class NodeView(QGraphicsView):
             return None
 
 
-    def add_node_with_ports(self, title="Node", x=0.0, y=0.0, node_type="generic", inputs=None, outputs=None, content=""):
+    def add_node_with_ports(self, title="Node", x=0.0, y=0.0, node_type="generic", inputs=None, outputs=None, content="", record_undo: bool = True):
         """Añade un nodo con puertos personalizados (listas de nombres)."""
         if str(node_type).lower() == 'variable':
             node = VariableNode(title=title, x=float(x), y=float(y), node_type='variable')
@@ -1967,6 +2477,18 @@ class NodeView(QGraphicsView):
         except Exception:
             pass
         self.evaluate_graph()
+        # Registrar undo/redo de creación
+        try:
+            if record_undo and not self._suspend_undo:
+                in_ports = [dict(p) for p in (inputs if inputs is not None else (node.input_ports or []))]
+                out_ports = [dict(p) for p in (outputs if outputs is not None else (node.output_ports or []))]
+                self._push_undo(
+                    undo_fn=lambda: self.remove_node(node, record_undo=False),
+                    redo_fn=lambda: self.add_node_with_ports(title=title, x=x, y=y, node_type=node_type, inputs=in_ports, outputs=out_ports, content=getattr(node, 'content', ''), record_undo=False),
+                    label="add_node"
+                )
+        except Exception:
+            pass
         return node
 
     def _generate_cpp_code_nodes(self, var_node=None, scene_pos=None):
@@ -2376,11 +2898,57 @@ class NodeView(QGraphicsView):
             if isinstance(item, NodeItem):
                 self._scene.removeItem(item)
     
-    def remove_node(self, node_item):
-        """Elimina un nodo específico y sus conexiones."""
-        # Eliminar todas las conexiones del nodo
+    def remove_node(self, node_item, record_undo: bool = True):
+        """Elimina un nodo específico y sus conexiones (con undo opcional)."""
+        # Snapshot para undo
+        created_ref = {"node": None}
+        try:
+            if record_undo and not self._suspend_undo:
+                title = getattr(node_item, 'title', 'Node')
+                node_type = getattr(node_item, 'node_type', 'generic')
+                pos = node_item.scenePos()
+                x, y = float(pos.x()), float(pos.y())
+                content = getattr(node_item, 'content', '')
+                inputs = [dict(p) for p in (getattr(node_item, 'input_ports', []) or [])]
+                outputs = [dict(p) for p in (getattr(node_item, 'output_ports', []) or [])]
+                # Capturar conexiones actuales del nodo
+                conns = []
+                for c in list(getattr(node_item, 'connections', []) or []):
+                    try:
+                        conns.append({
+                            'side': 'start' if c.start_item is node_item else 'end',
+                            'other': c.end_item if c.start_item is node_item else c.start_item,
+                            'start_port': getattr(c, 'start_port', 'output'),
+                            'end_port': getattr(c, 'end_port', 'input')
+                        })
+                    except Exception:
+                        pass
+                def undo_fn():
+                    created_ref["node"] = self.add_node_with_ports(title=title, x=x, y=y, node_type=node_type, inputs=inputs, outputs=outputs, content=content, record_undo=False)
+                    new_node = created_ref["node"]
+                    # Restaurar conexiones
+                    for cd in conns:
+                        try:
+                            if cd['side'] == 'start':
+                                self.add_connection(new_node, cd['other'], start_port=cd['start_port'], end_port=cd['end_port'], record_undo=False)
+                            else:
+                                self.add_connection(cd['other'], new_node, start_port=cd['start_port'], end_port=cd['end_port'], record_undo=False)
+                        except Exception:
+                            pass
+                def redo_fn():
+                    try:
+                        if created_ref["node"] is not None:
+                            self.remove_node(created_ref["node"], record_undo=False)
+                            created_ref["node"] = None
+                    except Exception:
+                        pass
+                self._push_undo(undo_fn=undo_fn, redo_fn=redo_fn, label="remove_node")
+        except Exception:
+            pass
+
+        # Eliminar todas las conexiones del nodo sin registrar undo por cada una
         for connection in node_item.connections[:]:
-            self.remove_connection(connection)
+            self.remove_connection(connection, record_undo=False)
         
         # Eliminar el nodo
         self._scene.removeItem(node_item)
@@ -2421,6 +2989,148 @@ class NodeView(QGraphicsView):
                     self.graphEvaluated.emit()
                 except Exception:
                     pass
+        except Exception:
+            pass
+
+    # ----------------------
+    # Persistencia (Export/Import)
+    # ----------------------
+    def export_graph(self) -> dict:
+        """Exporta los nodos y conexiones actuales a un diccionario serializable."""
+        nodes: list[NodeModel] = []
+        id_map = {}
+        try:
+            # Recoger nodos de la escena
+            for item in list(self._scene.items()):
+                if isinstance(item, NodeItem):
+                    try:
+                        inputs = [
+                            {"name": str(p.get("name", "input")), "kind": str(p.get("kind", "data"))}
+                            for p in (getattr(item, "input_ports", []) or [])
+                        ]
+                        outputs = [
+                            {"name": str(p.get("name", "output")), "kind": str(p.get("kind", "data"))}
+                            for p in (getattr(item, "output_ports", []) or [])
+                        ]
+                    except Exception:
+                        inputs, outputs = [], []
+                    nm = NodeModel(
+                        type=str(getattr(item, "node_type", "generic") or "generic"),
+                        title=str(getattr(item, "title", "Node") or "Node"),
+                        x=float(item.scenePos().x()),
+                        y=float(item.scenePos().y()),
+                        content=str(getattr(item, "content", "") or ""),
+                        inputs=inputs,
+                        outputs=outputs,
+                        meta={}
+                    )
+                    nodes.append(nm)
+                    id_map[item] = nm.id
+        except Exception:
+            pass
+
+        # Recoger conexiones
+        conns = []
+        try:
+            for c in list(self.connections):
+                sid = id_map.get(getattr(c, "start_item", None))
+                eid = id_map.get(getattr(c, "end_item", None))
+                if sid and eid:
+                    conns.append({
+                        "start": sid,
+                        "start_port": str(getattr(c, "start_port", "output") or "output"),
+                        "end": eid,
+                        "end_port": str(getattr(c, "end_port", "input") or "input"),
+                    })
+        except Exception:
+            pass
+
+        try:
+            scale_x = float(self.transform().m11())
+        except Exception:
+            scale_x = 1.0
+
+        project_dict = project_to_dict(nodes, meta={"view": {"zoom": scale_x}})
+        return {"project": project_dict, "connections": conns}
+
+    def import_graph(self, data: dict, clear: bool = True) -> None:
+        """Importa un grafo desde un diccionario y reconstruye la escena.
+
+        Si `clear` es True, limpia la escena actual antes de importar.
+        """
+        try:
+            if clear:
+                self.clear_nodes()
+        except Exception:
+            pass
+
+        id_to_item = {}
+        # Crear nodos
+        try:
+            models = project_from_dict(data.get("project", {}))
+            for nm in models:
+                try:
+                    # inputs/outputs ya vienen como lista de dicts {name, kind}
+                    node = self.add_node_with_ports(
+                        title=str(nm.title or "Node"),
+                        x=float(nm.x),
+                        y=float(nm.y),
+                        node_type=str(nm.type or "generic"),
+                        inputs=[dict(p) for p in (nm.inputs or [])],
+                        outputs=[dict(p) for p in (nm.outputs or [])],
+                        content=str(nm.content or ""),
+                        record_undo=False,
+                    )
+                    if node is not None:
+                        id_to_item[nm.id] = node
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # Crear conexiones
+        try:
+            for cd in list(data.get("connections", []) or []):
+                sid = cd.get("start")
+                eid = cd.get("end")
+                sitem = id_to_item.get(sid)
+                eitem = id_to_item.get(eid)
+                if sitem is not None and eitem is not None:
+                    try:
+                        self.add_connection(
+                            sitem,
+                            eitem,
+                            start_port=str(cd.get("start_port", "output") or "output"),
+                            end_port=str(cd.get("end_port", "input") or "input"),
+                            record_undo=False,
+                        )
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        # Ajuste de vista y evaluación
+        try:
+            items = list(id_to_item.values())
+            if items:
+                combined = items[0].sceneBoundingRect()
+                for it in items[1:]:
+                    combined = combined.united(it.sceneBoundingRect())
+                pad = max(60.0, max(combined.width(), combined.height()) * 0.15)
+                padded = combined.adjusted(-pad, -pad, pad, pad)
+                old_anchor = self.transformationAnchor()
+                self.setTransformationAnchor(QGraphicsView.AnchorViewCenter)
+                self.fitInView(padded, Qt.KeepAspectRatio)
+                self.setTransformationAnchor(old_anchor)
+                self._zoom = 0
+                try:
+                    self.zoomChanged.emit(float(self.transform().m11()))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            self.evaluate_graph()
         except Exception:
             pass
 
@@ -2492,11 +3202,17 @@ class NodeView(QGraphicsView):
             # Texto siempre nítido al zoom
             for text_item in getattr(node, "text_items", []):
                 text_item.setFlag(node.ItemIgnoresTransformations, True)
-            # Sombra opcional
-            shadow = QGraphicsDropShadowEffect()
-            shadow.setBlurRadius(6)
-            shadow.setOffset(2, 2)
-            node.setGraphicsEffect(shadow)
+            # Sombra opcional (desactivada por defecto)
+            if getattr(self, '_node_shadows_enabled', False):
+                shadow = QGraphicsDropShadowEffect()
+                shadow.setBlurRadius(6)
+                shadow.setOffset(2, 2)
+                node.setGraphicsEffect(shadow)
+            else:
+                try:
+                    node.setGraphicsEffect(None)
+                except Exception:
+                    pass
         except Exception:
             pass
 
@@ -2609,18 +3325,34 @@ class NodeView(QGraphicsView):
             return None
 
     def _find_node_and_port_near_input(self, scene_pos: QPointF, threshold: float = 16.0):
-        """Devuelve (nodo, nombre_de_puerto) si hay un puerto de entrada cercano."""
+        """Devuelve (nodo, nombre_de_puerto) si hay un puerto de entrada cercano.
+
+        Optimización: consulta sólo los items en un rectángulo pequeño alrededor
+        de la posición dada para reducir iteraciones sobre toda la escena.
+        """
         try:
+            # Rectángulo de búsqueda centrado en scene_pos con tamaño basado en threshold
+            half = float(max(8.0, threshold))
+            rect = QRectF(scene_pos.x() - half, scene_pos.y() - half, half * 2.0, half * 2.0)
+
             best_tuple = (None, None)
             best_dist = float('inf')
-            for item in self._scene.items():
+
+            # Limitar búsqueda a elementos dentro del rectángulo
+            for item in self._scene.items(rect):
                 if isinstance(item, NodeItem):
-                    for p in item.input_ports:
-                        pos = item.get_port_position(p["name"], "input")
-                        dist = (scene_pos - pos).manhattanLength()
-                        if dist < best_dist:
-                            best_dist = dist
-                            best_tuple = (item, p["name"])
+                    # Iterar puertos de entrada de cada nodo visible en el área
+                    for p in getattr(item, 'input_ports', []) or []:
+                        try:
+                            pos = item.get_port_position(p["name"], "input")
+                            dist = (scene_pos - pos).manhattanLength()
+                            if dist < best_dist:
+                                best_dist = dist
+                                best_tuple = (item, p["name"])
+                        except Exception:
+                            # Ignorar errores por nodos sin API completa
+                            pass
+
             return best_tuple if best_tuple[0] is not None and best_dist <= threshold else (None, None)
         except Exception:
             return (None, None)

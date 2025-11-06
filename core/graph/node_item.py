@@ -2,7 +2,7 @@ from PySide6.QtWidgets import (
     QApplication, QGraphicsRectItem, QGraphicsTextItem, QGraphicsView, QGraphicsScene, QGraphicsItem,
     QPlainTextEdit, QWidget, QGraphicsProxyWidget, QGraphicsDropShadowEffect, QPushButton
 )
-from PySide6.QtCore import QRectF, Qt, QPointF, QSize
+from PySide6.QtCore import QRectF, Qt, QPointF, QSize, QTimer
 from PySide6.QtGui import QBrush, QColor, QPen, QFont, QPainter, QPainterPath, QLinearGradient
 import sys
 
@@ -24,6 +24,8 @@ class CodeEditor(QPlainTextEdit):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._host_node = None  # Se establece desde NodeItem
+        # Flag anti-reentrancia para el pintado de números de línea
+        self._painting_line_numbers = False
         self.lineNumberArea = LineNumberArea(self)
         self.blockCountChanged.connect(self.updateLineNumberAreaWidth)
         self.updateRequest.connect(self.updateLineNumberArea)
@@ -72,21 +74,32 @@ class CodeEditor(QPlainTextEdit):
         self.lineNumberArea.setGeometry(cr.left(), cr.top(), self.lineNumberAreaWidth(), cr.height())
 
     def lineNumberAreaPaintEvent(self, event):
+        # Evitar reentrancia: si ya estamos pintando, salimos
+        if getattr(self, '_painting_line_numbers', False):
+            return
+        self._painting_line_numbers = True
         painter = QPainter(self.lineNumberArea)
-        painter.fillRect(event.rect(), QColor("#0b1220"))
-        block = self.firstVisibleBlock()
-        blockNumber = block.blockNumber()
-        top = self.blockBoundingGeometry(block).translated(self.contentOffset()).top()
-        bottom = top + self.blockBoundingRect(block).height()
-        while block.isValid() and top <= event.rect().bottom():
-            if block.isVisible() and bottom >= event.rect().top():
-                number = str(blockNumber + 1)
-                painter.setPen(QColor("#64748b"))
-                painter.drawText(0, int(top), int(self.lineNumberArea.width()) - 4, int(self.fontMetrics().height()), Qt.AlignRight, number)
-            block = block.next()
-            top = bottom
+        try:
+            painter.fillRect(event.rect(), QColor("#0b1220"))
+            block = self.firstVisibleBlock()
+            blockNumber = block.blockNumber()
+            top = self.blockBoundingGeometry(block).translated(self.contentOffset()).top()
             bottom = top + self.blockBoundingRect(block).height()
-            blockNumber += 1
+            while block.isValid() and top <= event.rect().bottom():
+                if block.isVisible() and bottom >= event.rect().top():
+                    number = str(blockNumber + 1)
+                    painter.setPen(QColor("#64748b"))
+                    painter.drawText(0, int(top), int(self.lineNumberArea.width()) - 4, int(self.fontMetrics().height()), Qt.AlignRight, number)
+                block = block.next()
+                top = bottom
+                bottom = top + self.blockBoundingRect(block).height()
+                blockNumber += 1
+        finally:
+            try:
+                painter.end()
+            except Exception:
+                pass
+            self._painting_line_numbers = False
 
     def keyPressEvent(self, event):
         # Salir de modo edición con ESC
@@ -167,6 +180,8 @@ class NodeItem(QGraphicsRectItem):
         # Valores de puertos (runtime)
         self.input_values = {}
         self.output_values = {}
+        # Estado del nodo (Blender‑like)
+        self.muted = False
 
         # Ampliación simple en bordes (hitbox más generosa)
         self._edge_expand_px = 4
@@ -208,14 +223,8 @@ class NodeItem(QGraphicsRectItem):
         self.title_item.setFlag(QGraphicsItem.ItemIsFocusable, False)
         self._update_title_pos()
         # Sombra sutil en el título (evitar neon, look más profesional)
-        try:
-            self._title_glow = QGraphicsDropShadowEffect(self)
-            self._title_glow.setBlurRadius(6)
-            self._title_glow.setColor(QColor(0, 0, 0, 160))  # sombra negra suave
-            self._title_glow.setOffset(0, 1)
-            self.title_item.setGraphicsEffect(self._title_glow)
-        except Exception:
-            self._title_glow = None
+        # Evitar efectos de sombra que pueden causar repintados reentrantes en algunos sistemas
+        self._title_glow = None
 
         # Estilo de título plano (sin prefijo), más cercano a Houdini
         self._title_is_comment_style = False
@@ -247,14 +256,7 @@ class NodeItem(QGraphicsRectItem):
             pass
         self._update_content_layout()
         # Sombra sutil en el contenido (evitar neon)
-        try:
-            self._content_glow = QGraphicsDropShadowEffect(self)
-            self._content_glow.setBlurRadius(5)
-            self._content_glow.setColor(QColor(0, 0, 0, 140))
-            self._content_glow.setOffset(0, 1)
-            self.content_item.setGraphicsEffect(self._content_glow)
-        except Exception:
-            self._content_glow = None
+        self._content_glow = None
         # Registrar items de texto para efectos desde la vista
         try:
             self.text_items = [self.title_item, self.content_item]
@@ -269,6 +271,15 @@ class NodeItem(QGraphicsRectItem):
             self.content_editor._host_node = self
         except Exception:
             pass
+        # Evaluación en vivo: debounced mientras se escribe en el editor incrustado
+        try:
+            self._inline_edit_timer = QTimer()
+            self._inline_edit_timer.setSingleShot(True)
+            self._inline_edit_timer.setInterval(100)
+            self._inline_edit_timer.timeout.connect(self._inline_live_evaluate)
+            self.content_editor.textChanged.connect(self._on_inline_text_changed)
+        except Exception:
+            self._inline_edit_timer = None
         self.content_editor_proxy = QGraphicsProxyWidget(self)
         self.content_editor_proxy.setWidget(self.content_editor)
         self.content_editor_proxy.setVisible(False)
@@ -280,6 +291,34 @@ class NodeItem(QGraphicsRectItem):
             self._inline_syntax = PythonHighlighter(self.content_editor.document())
         except Exception:
             self._inline_syntax = None
+
+    def _on_inline_text_changed(self):
+        """Arranca el temporizador de evaluación en vivo cuando cambia el texto."""
+        try:
+            if self._inline_edit_timer is not None:
+                self._inline_edit_timer.start()
+        except Exception:
+            pass
+
+    def _inline_live_evaluate(self):
+        """Sincroniza el contenido y solicita evaluación del grafo."""
+        try:
+            # Actualizar el atributo de contenido con el texto actual
+            self.content = (self.content_editor.toPlainText() or "").strip()
+        except Exception:
+            pass
+        # Solicitar evaluación del grafo desde la(s) vista(s) que contienen este nodo
+        try:
+            sc = self.scene()
+            if sc:
+                for v in sc.views():
+                    if hasattr(v, 'evaluate_graph'):
+                        try:
+                            v.evaluate_graph()
+                        except Exception:
+                            pass
+        except Exception:
+            pass
 
     def _update_title_pos(self):
         rect = self.rect()
@@ -415,13 +454,30 @@ class NodeItem(QGraphicsRectItem):
     # ----------------------
     def set_ports(self, inputs=None, outputs=None):
         """Define listas de puertos de entrada y salida.
-        inputs/outputs: lista de nombres (str)."""
+        inputs/outputs: pueden ser listas de nombres (str) o dicts con
+        al menos 'name'. Se admite 'kind' opcional ('exec'|'data')."""
         if inputs is not None:
-            # Respetar explícitamente listas vacías si se pasan
-            self.input_ports = [{"name": name, "type": "input", "node": self} for name in inputs]
+            self.input_ports = []
+            for item in (inputs or []):
+                if isinstance(item, dict):
+                    name = str(item.get("name", "input"))
+                    kind = str(item.get("kind", "data")).lower()
+                    multi = bool(item.get("multi", False))
+                else:
+                    name = str(item)
+                    kind = "data"
+                    multi = False
+                self.input_ports.append({"name": name, "type": "input", "kind": kind, "multi": multi, "node": self})
         if outputs is not None:
-            # Respetar explícitamente listas vacías si se pasan
-            self.output_ports = [{"name": name, "type": "output", "node": self} for name in outputs]
+            self.output_ports = []
+            for item in (outputs or []):
+                if isinstance(item, dict):
+                    name = str(item.get("name", "output"))
+                    kind = str(item.get("kind", "data")).lower()
+                else:
+                    name = str(item)
+                    kind = "data"
+                self.output_ports.append({"name": name, "type": "output", "kind": kind, "node": self})
         # Sólo agregar por defecto si no se proporcionó parámetro (None)
         if inputs is None and not self.input_ports:
             self.add_input_port("input")
@@ -592,10 +648,37 @@ class NodeItem(QGraphicsRectItem):
             except Exception:
                 in_conn_count = 0
             highlight = (self._snap_hint_input_port_name == port.get("name"))
-            base_color = QColor("#4a5568") if not connected else QColor("#7c8aa5")
-            hi_color = QColor("#74c0fc")
+            # Detectar tipo de puerto: exec vs data
+            port_name = str(port.get("name", "input"))
+            port_kind = str(port.get("kind", "data")).lower() if port is not None else "data"
+            if port_kind not in ("exec", "data"):
+                port_kind = "exec" if "exec" in port_name.lower() else "data"
+            if port_kind == "exec":
+                base_color = QColor("#9ca3af") if not connected else QColor("#cbd5e1")
+                hi_color = QColor("#ffffff")
+                ring_color = QColor("#334155")
+                glow_color = QColor(255, 255, 255, 96)
+                badge_border = QColor("#e5e7eb")
+                badge_fill = QColor(55, 65, 81)
+                badge_text = QColor("#f9fafb")
+                pill_pen = QColor("#e5e7eb")
+                pill_grad_top = QColor(50, 58, 70, 180)
+                pill_grad_bot = QColor(35, 42, 52, 180)
+                text_color = QColor("#f1f5f9") if highlight else QColor("#e2e8f0")
+            else:
+                base_color = QColor("#4a5568") if not connected else QColor("#7c8aa5")
+                hi_color = QColor("#74c0fc")
+                ring_color = QColor("#1e293b")
+                glow_color = QColor(116, 192, 252, 96)
+                badge_border = QColor("#3b82f6")
+                badge_fill = QColor(30, 58, 138)
+                badge_text = QColor("#e0f2fe")
+                pill_pen = QColor("#3b82f6")
+                pill_grad_top = QColor(32, 52, 112, 175)
+                pill_grad_bot = QColor(18, 30, 68, 175)
+                text_color = QColor("#e0f2fe") if highlight else QColor("#cbd5e1")
             # anillo externo sutil para dar presencia al pin
-            painter.setPen(QPen(QColor("#1e293b"), 2))
+            painter.setPen(QPen(ring_color, 2))
             painter.setBrush(Qt.NoBrush)
             painter.drawEllipse(QRectF(center.x() - 8, center.y() - 8, 16, 16))
             painter.setPen(QPen(hi_color if highlight else QColor("#3a3f4b"), 2 if highlight else 1))
@@ -606,17 +689,17 @@ class NodeItem(QGraphicsRectItem):
             if highlight:
                 glow = port_rect.adjusted(-6, -6, 6, 6)
                 painter.setPen(Qt.NoPen)
-                painter.setBrush(QBrush(QColor(116, 192, 252, 96)))
+                painter.setBrush(QBrush(glow_color))
                 painter.drawEllipse(glow)
             # Badge de cantidad de conexiones (IN)
             try:
                 if in_conn_count > 0:
                     badge_r = 9
                     badge_rect = QRectF(center.x() - badge_r, center.y() - 18, badge_r * 2, badge_r * 2)
-                    painter.setPen(QPen(QColor("#3b82f6"), 1))
-                    painter.setBrush(QBrush(QColor(30, 58, 138)))
+                    painter.setPen(QPen(badge_border, 1))
+                    painter.setBrush(QBrush(badge_fill))
                     painter.drawEllipse(badge_rect)
-                    painter.setPen(QPen(QColor("#e0f2fe"), 1))
+                    painter.setPen(QPen(badge_text, 1))
                     painter.setFont(QFont("Sans", 8, QFont.Bold))
                     painter.drawText(badge_rect, Qt.AlignCenter, str(in_conn_count))
             except Exception:
@@ -637,13 +720,13 @@ class NodeItem(QGraphicsRectItem):
                     bg_rect = QRectF(left_x, top_y, pill_w, pill_h)
                     from PySide6.QtGui import QLinearGradient
                     grad_in = QLinearGradient(bg_rect.topLeft(), bg_rect.bottomLeft())
-                    grad_in.setColorAt(0.0, QColor(32, 52, 112, 175))
-                    grad_in.setColorAt(1.0, QColor(18, 30, 68, 175))
-                    painter.setPen(QPen(QColor("#3b82f6"), 1))
+                    grad_in.setColorAt(0.0, pill_grad_top)
+                    grad_in.setColorAt(1.0, pill_grad_bot)
+                    painter.setPen(QPen(pill_pen, 1))
                     painter.setBrush(QBrush(grad_in))
                     painter.drawRoundedRect(bg_rect, pill_radius, pill_radius)
                     # Texto
-                    painter.setPen(QPen(QColor("#e0f2fe" if highlight else "#cbd5e1"), 1))
+                    painter.setPen(QPen(text_color, 1))
                     painter.drawText(QPointF(left_x + pill_pad_x, baseline_y), name)
             except Exception:
                 pass
@@ -659,10 +742,36 @@ class NodeItem(QGraphicsRectItem):
             except Exception:
                 out_conn_count = 0
             highlight = (self._snap_hint_output_port_name == port.get("name"))
-            base_color = QColor("#4a5568") if not connected else QColor("#7c8aa5")
-            hi_color = QColor("#f59e0b")
+            port_name = str(port.get("name", "output"))
+            port_kind = str(port.get("kind", "data")).lower()
+            if port_kind not in ("exec", "data"):
+                port_kind = "exec" if "exec" in port_name.lower() else "data"
+            if port_kind == "exec":
+                base_color = QColor("#9ca3af") if not connected else QColor("#cbd5e1")
+                hi_color = QColor("#ffffff")
+                ring_color = QColor("#334155")
+                glow_color = QColor(255, 255, 255, 96)
+                badge_border = QColor("#e5e7eb")
+                badge_fill = QColor(55, 65, 81)
+                badge_text = QColor("#f9fafb")
+                pill_pen = QColor("#e5e7eb")
+                pill_grad_top = QColor(50, 58, 70, 180)
+                pill_grad_bot = QColor(35, 42, 52, 180)
+                text_color = QColor("#f1f5f9") if highlight else QColor("#e2e8f0")
+            else:
+                base_color = QColor("#4a5568") if not connected else QColor("#7c8aa5")
+                hi_color = QColor("#f59e0b")
+                ring_color = QColor("#1e293b")
+                glow_color = QColor(245, 158, 11, 96)
+                badge_border = QColor("#f59e0b")
+                badge_fill = QColor(120, 53, 15)
+                badge_text = QColor("#ffedd5")
+                pill_pen = QColor("#f59e0b")
+                pill_grad_top = QColor(166, 88, 26, 180)
+                pill_grad_bot = QColor(112, 60, 18, 180)
+                text_color = QColor("#ffedd5" if highlight else "#f1c79b")
             # anillo externo sutil para dar presencia al pin
-            painter.setPen(QPen(QColor("#1e293b"), 2))
+            painter.setPen(QPen(ring_color, 2))
             painter.setBrush(Qt.NoBrush)
             painter.drawEllipse(QRectF(center.x() - 8, center.y() - 8, 16, 16))
             painter.setPen(QPen(hi_color if highlight else QColor("#3a3f4b"), 2 if highlight else 1))
@@ -673,17 +782,17 @@ class NodeItem(QGraphicsRectItem):
             if highlight:
                 glow = port_rect.adjusted(-6, -6, 6, 6)
                 painter.setPen(Qt.NoPen)
-                painter.setBrush(QBrush(QColor(245, 158, 11, 96)))
+                painter.setBrush(QBrush(glow_color))
                 painter.drawEllipse(glow)
             # Badge de cantidad de conexiones (OUT)
             try:
                 if out_conn_count > 0:
                     badge_r = 9
                     badge_rect = QRectF(center.x() - badge_r, center.y() - 18, badge_r * 2, badge_r * 2)
-                    painter.setPen(QPen(QColor("#f59e0b"), 1))
-                    painter.setBrush(QBrush(QColor(120, 53, 15)))
+                    painter.setPen(QPen(badge_border, 1))
+                    painter.setBrush(QBrush(badge_fill))
                     painter.drawEllipse(badge_rect)
-                    painter.setPen(QPen(QColor("#ffedd5"), 1))
+                    painter.setPen(QPen(badge_text, 1))
                     painter.setFont(QFont("Sans", 8, QFont.Bold))
                     painter.drawText(badge_rect, Qt.AlignCenter, str(out_conn_count))
             except Exception:
@@ -704,13 +813,13 @@ class NodeItem(QGraphicsRectItem):
                     bg_rect = QRectF(right_edge - pill_w, top_y, pill_w, pill_h)
                     from PySide6.QtGui import QLinearGradient
                     grad_out = QLinearGradient(bg_rect.topLeft(), bg_rect.bottomLeft())
-                    grad_out.setColorAt(0.0, QColor(166, 88, 26, 180))
-                    grad_out.setColorAt(1.0, QColor(112, 60, 18, 180))
-                    painter.setPen(QPen(QColor("#f59e0b"), 1))
+                    grad_out.setColorAt(0.0, pill_grad_top)
+                    grad_out.setColorAt(1.0, pill_grad_bot)
+                    painter.setPen(QPen(pill_pen, 1))
                     painter.setBrush(QBrush(grad_out))
                     painter.drawRoundedRect(bg_rect, pill_radius, pill_radius)
                     # Texto
-                    painter.setPen(QPen(QColor("#ffedd5" if highlight else "#f1c79b"), 1))
+                    painter.setPen(QPen(text_color, 1))
                     painter.drawText(QPointF(bg_rect.x() + pill_pad_x, baseline_y), name)
             except Exception:
                 pass
@@ -959,9 +1068,10 @@ class NodeItem(QGraphicsRectItem):
         except Exception:
             pass
     
-    def add_input_port(self, name):
-        """Agrega un puerto de entrada."""
-        port = {"name": name, "type": "input", "node": self}
+    def add_input_port(self, name, kind: str = "data"):
+        """Agrega un puerto de entrada.
+        kind: 'exec' o 'data' (por defecto 'data')."""
+        port = {"name": name, "type": "input", "kind": str(kind).lower(), "multi": False, "node": self}
         self.input_ports.append(port)
         # Inicializar valor de entrada
         try:
@@ -971,9 +1081,10 @@ class NodeItem(QGraphicsRectItem):
         self.update()
         return port
     
-    def add_output_port(self, name):
-        """Agrega un puerto de salida."""
-        port = {"name": name, "type": "output", "node": self}
+    def add_output_port(self, name, kind: str = "data"):
+        """Agrega un puerto de salida.
+        kind: 'exec' o 'data' (por defecto 'data')."""
+        port = {"name": name, "type": "output", "kind": str(kind).lower(), "node": self}
         self.output_ports.append(port)
         # Inicializar valor de salida
         try:
@@ -1079,10 +1190,38 @@ class NodeItem(QGraphicsRectItem):
         node_type = str(getattr(self, 'node_type', 'generic') or 'generic').lower()
         result = dict(self.output_values or {})
 
+        # Si el nodo está silenciado (muted), hace passthrough del primer input
+        try:
+            if getattr(self, 'muted', False):
+                passthrough_val = None
+                for p in (self.input_ports or []):
+                    name = p.get('name', 'input')
+                    v = (self.input_values or {}).get(name, None)
+                    if v is None:
+                        continue
+                    if isinstance(v, list):
+                        for sv in reversed(v):
+                            if sv is not None:
+                                passthrough_val = sv
+                                break
+                    else:
+                        passthrough_val = v
+                    if passthrough_val is not None:
+                        break
+                for op in (self.output_ports or []):
+                    result[op.get('name', 'output')] = passthrough_val
+                self.output_values.update(result)
+                return result
+        except Exception:
+            pass
+
         if node_type in ('generic', 'input'):
-            val = None
+            # Preferir el atributo `content`, que se sincroniza en vivo durante la edición.
+            # Si está vacío, caer a `to_plain_text()` (texto del render plano).
             try:
-                val = self.to_plain_text()
+                val = getattr(self, 'content', '')
+                if val is None or val == "":
+                    val = self.to_plain_text()
             except Exception:
                 val = getattr(self, 'content', '')
             # Usar puerto 'output' por defecto
@@ -1114,6 +1253,17 @@ class NodeItem(QGraphicsRectItem):
             if self.input_ports:
                 in_name = self.input_ports[0]['name']
                 in_val = (self.input_values or {}).get(in_name, None)
+            # Normalizar listas provenientes de conexiones de tipo 'data'
+            # Usar el último valor no nulo como escalar para la expresión
+            if isinstance(in_val, list):
+                try:
+                    for sv in reversed(in_val):
+                        if sv is not None:
+                            in_val = sv
+                            break
+                    # Si todos eran None, mantener None
+                except Exception:
+                    pass
             expr = getattr(self, 'content', '') or ''
             val = self._safe_eval_process(expr, in_val)
             if self.output_ports:

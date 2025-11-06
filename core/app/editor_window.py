@@ -1,1536 +1,714 @@
-from PySide6.QtWidgets import (
-    QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QToolBar, QFileDialog, QMessageBox, QSplitter, QStatusBar, QLabel, QTextEdit, QTabWidget, QPushButton, QCheckBox, QToolButton, QButtonGroup, QMenu
-)
-from PySide6.QtCore import QTimer
+from __future__ import annotations
+
+from typing import Optional
+
+from PySide6 import QtCore, QtGui, QtWidgets
 from ..graph.node_item import NodeItem
-from PySide6.QtGui import QAction, QShortcut, QKeySequence  # ✅ Correcto
-from PySide6.QtCore import Qt, QTimer, QEvent, QSize, QDir
-import importlib
-import logging
+from .blueprint_editor_window import BlueprintEditorWindow
+from .node_content_editor_window import NodeContentEditorWindow
+from .output_preview_window import OutputPreviewWindow
 
-logger = logging.getLogger("core.editor_window")
-
-
-class EditorWindow(QMainWindow):
-    def __init__(self):
-        super().__init__()
-        self.setWindowTitle("Editor de Texto y Nodos")
-        self._current_node = None
-        self._editing_mode = False
-        self._updating_text = False
-        self._node_controller = None
-        self._inline_editor_node = None
-
-        central = QWidget(self)
-        # Splitter externo: Explorer | panel principal
-        self.outer_splitter = QSplitter(Qt.Horizontal, central)
-        self.outer_splitter.setChildrenCollapsible(False)
-        self.outer_splitter.setHandleWidth(8)
-        self._sidebar_collapsed = False
-        self._sidebar_last_size = 240
-
-        # --- Sidebar Explorer estilo VS Code ---
+# Carga robusta de FileExplorer con rutas absoluta y relativa
+def _import_file_explorer():
+    try:
+        from core.ui.file_explorer import FileExplorer as FE  # type: ignore
+        return FE
+    except Exception as e_abs:
         try:
-            from ..ui.file_explorer import FileExplorer
-            self.file_explorer = FileExplorer()
-            self.file_explorer.setMinimumWidth(220)
-            self.file_explorer.file_opened.connect(self._on_file_opened)
-            self.outer_splitter.addWidget(self.file_explorer)
-        except Exception:
-            self.file_explorer = None
-            placeholder_sidebar = QWidget()
-            placeholder_sidebar.setMinimumWidth(180)
-            self.outer_splitter.addWidget(placeholder_sidebar)
+            from ..ui.file_explorer import FileExplorer as FE  # type: ignore
+            return FE
+        except Exception as e_rel:
+            print(f"[EditorWindow] Error importando FileExplorer: abs={e_abs} rel={e_rel}")
+            return None
 
-        # --- Panel principal: editor de texto + NodeView + Inspector ---
-        main_panel = QWidget()
-        self.inner_splitter = QSplitter(Qt.Horizontal, main_panel)
-        self.inner_splitter.setChildrenCollapsible(False)
-        self.inner_splitter.setHandleWidth(6)
+FileExplorer = _import_file_explorer()
 
-        # --- Panel izquierdo: editor de texto + barra de vista previa ---
-        from ..ui.text_editor import TextEditor, PythonHighlighter
-        left_panel = QWidget()
-        left_vbox = QVBoxLayout(left_panel)
-        left_vbox.setContentsMargins(0, 0, 0, 0)
-        left_vbox.setSpacing(0)
-
-        # Editor principal
-        self.text_editor = TextEditor()
-        self.text_editor.setPlaceholderText(
-            "Selecciona un nodo para ver su contenido. Doble‑click para editar."
+# Cargar NodeView si existe; de lo contrario usar un placeholder
+class _PlaceholderNodeView(QtWidgets.QWidget):
+    def __init__(self, parent: Optional[QtWidgets.QWidget] = None) -> None:
+        super().__init__(parent)
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        lbl = QtWidgets.QLabel(
+            "NodeView no disponible. Se usa un panel placeholder.", self
         )
-        # Resaltado sintáctico básico (Python por ahora)
+        lbl.setAlignment(QtCore.Qt.AlignCenter)
+        layout.addWidget(lbl)
+
+
+def _load_node_view(parent: QtWidgets.QWidget) -> QtWidgets.QWidget:
+    try:
+        from ..graph.node_view import NodeView  # type: ignore
+        w = NodeView(parent=parent)
+        return w
+    except Exception:
+        return _PlaceholderNodeView(parent)
+
+
+class EditorWindow(QtWidgets.QMainWindow):
+    """
+    Nueva implementación simplificada y robusta del EditorWindow.
+
+    Objetivos clave:
+    - Barra de actividad izquierda con botón de Carpeta.
+    - Splitter principal con FileExplorer a la izquierda y el panel de trabajo a la derecha.
+    - Asegurar que el Explorer sea visible y refrescado al pulsar el botón Carpeta.
+    - Persistir el ancho del sidebar y su estado (colapsado/no colapsado) con QSettings.
+    """
+
+    ORGANIZATION = "Codemind-Visual"
+    APP_NAME = "Semantic-Node-Editor"
+
+    def __init__(self, parent: Optional[QtWidgets.QWidget] = None) -> None:
+        super().__init__(parent)
+
+        self.setWindowTitle("Editor de Texto y Nodos")
+        self.resize(1200, 800)
+
+        # Estado sidebar
+        self._sidebar_collapsed: bool = False
+        self._sidebar_last_size: int = 90
+
+        # QSettings para persistir UI
+        self._settings = QtCore.QSettings(self.ORGANIZATION, self.APP_NAME)
+
+        # UI principal
+        central = QtWidgets.QWidget(self)
+        root_layout = QtWidgets.QHBoxLayout(central)
+        root_layout.setContentsMargins(0, 0, 0, 0)
+        root_layout.setSpacing(0)
+
+        # Barra de actividad global (vertical, izquierda)
+        self._activity_bar = self._build_activity_bar()
+        root_layout.addWidget(self._activity_bar)
+
+        # Splitter principal: Explorer | Panel de trabajo
+        self.outer_splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal, self)
+        self.outer_splitter.setChildrenCollapsible(False)
+        root_layout.addWidget(self.outer_splitter, 1)
+
+        # Explorer a la izquierda
+        self.file_explorer = self._build_file_explorer()
+        # Presentación compacta al estilo VS Code (sin rail interno)
         try:
-            self._syntax = PythonHighlighter(self.text_editor.document())
-        except Exception:
-            self._syntax = None
-        self.text_editor.textChanged.connect(self.on_text_changed)
-        left_vbox.addWidget(self.text_editor)
-
-        # Visor inferior con pestañas estilo Houdini
-        try:
-            self.viewer_tabs = QTabWidget()
-            self.viewer_tabs.setTabPosition(QTabWidget.South)
-            self.viewer_tabs.setDocumentMode(True)
-            self.viewer_tabs.setStyleSheet("QTabWidget::pane{border-top:1px solid #2a2f39;} QTabBar::tab{padding:6px 10px;}")
-            # Pestaña Selección
-            self.preview_selected = QTextEdit()
-            self.preview_selected.setReadOnly(True)
-            self.preview_selected.setTextInteractionFlags(Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard)
-            self.preview_selected.setContextMenuPolicy(Qt.NoContextMenu)
-            self.preview_selected.setPlaceholderText("Selección: vista previa de nodo (solo lectura)")
-            self.preview_selected.setStyleSheet("QTextEdit{background:#121417;color:#cdd7e1;font:11px 'Consolas','Segoe UI',monospace;padding:6px;}")
-            # Pestaña Outputs (todos)
-            self.preview_outputs = QTextEdit()
-            self.preview_outputs.setReadOnly(True)
-            self.preview_outputs.setTextInteractionFlags(Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard)
-            self.preview_outputs.setContextMenuPolicy(Qt.NoContextMenu)
-            self.preview_outputs.setPlaceholderText("Outputs: combinación de todos los nodos Output")
-            self.preview_outputs.setStyleSheet("QTextEdit{background:#0f1318;color:#d7e3f0;font:11px 'Consolas','Segoe UI',monospace;padding:6px;}")
-            self.viewer_tabs.addTab(self.preview_selected, "Selección")
-            self.viewer_tabs.addTab(self.preview_outputs, "Outputs")
-            self.viewer_tabs.setMaximumHeight(170)
-            left_vbox.addWidget(self.viewer_tabs)
-            # Botón rápido para guardar el combinado como nodo
-            self._save_combined_btn = QPushButton("Guardar combinado → Nodo")
-            self._save_combined_btn.setStyleSheet("QPushButton{background:#1d2330;color:#cbd5e1;border:1px solid #2a2f39;padding:4px 8px;} QPushButton:hover{background:#20283a;}")
-            self._save_combined_btn.clicked.connect(self._save_combined_as_node)
-            left_vbox.addWidget(self._save_combined_btn)
-            # Toggle: combinar todos los nodos en Outputs
-            self._combine_all_mode = False
-            self._combine_all_toggle = QCheckBox("Combinar todo")
-            self._combine_all_toggle.setToolTip("Combina el texto de todos los nodos y lo muestra en Outputs")
-            self._combine_all_toggle.toggled.connect(self._on_combine_all_toggled)
-            left_vbox.addWidget(self._combine_all_toggle)
-            # Toggle: combinar por camino hacia el Output seleccionado
-            self._combine_by_path_toggle = QCheckBox("Por camino al Output")
-            self._combine_by_path_toggle.setToolTip("Combina sólo los nodos conectados aguas arriba del Output seleccionado, en orden de flujo")
-            self._combine_by_path_toggle.toggled.connect(lambda *_: self._update_outputs_tab())
-            left_vbox.addWidget(self._combine_by_path_toggle)
-
-            # Timers de debounce para mejorar rendimiento
-            self._outputs_update_timer = QTimer(self)
-            self._outputs_update_timer.setSingleShot(True)
-            # Intervalo más corto para respuesta visual rápida
-            self._outputs_update_timer.setInterval(60)
-            self._outputs_update_timer.timeout.connect(self._update_outputs_tab)
-
-            self._graph_eval_timer = QTimer(self)
-            self._graph_eval_timer.setSingleShot(True)
-            # Evaluación más ágil pero protegida contra ráfagas
-            self._graph_eval_timer.setInterval(35)
-            self._graph_eval_timer.timeout.connect(self._evaluate_graph_safe)
-        except Exception:
-            # Fallback a barra simple si falla la creación de tabs
-            self.preview_bar = QTextEdit()
-            try:
-                self.preview_bar.setReadOnly(True)
-                self.preview_bar.setTextInteractionFlags(Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard)
-                self.preview_bar.setContextMenuPolicy(Qt.NoContextMenu)
-                self.preview_bar.setMaximumHeight(140)
-                self.preview_bar.setPlaceholderText("Vista previa del nodo seleccionado (solo lectura)")
-                self.preview_bar.setStyleSheet(
-                    "QTextEdit{background:#121417;color:#cdd7e1;border-top:1px solid #2a2f39;font:11px 'Consolas','Segoe UI',monospace;padding:6px;}"
-                )
-            except Exception:
-                pass
-            left_vbox.addWidget(self.preview_bar)
-
-        self.inner_splitter.addWidget(left_panel)
-
-        # Nodo actualmente editado
-        self.current_node = None
-
-        # --- Panel derecho: NodeView ---
-        self.node_view = self._load_node_view()
-        self.inner_splitter.addWidget(self.node_view)
-        # Actualizar pestaña Outputs cuando se evalúe el grafo
-        try:
-            # Usar debounce para refrescar Outputs tras evaluar el grafo
-            self.node_view.graphEvaluated.connect(self._schedule_update_outputs)
-            # Inicializar la pestaña Outputs al arrancar (puede perderse la
-            # primera emisión si NodeView evalúa antes de conectar la señal)
-            self._schedule_update_outputs()
+            if hasattr(self.file_explorer, "set_compact_mode"):
+                self.file_explorer.set_compact_mode(True)
         except Exception:
             pass
-        
-        # Inspector (derecha)
+        self.outer_splitter.addWidget(self.file_explorer)
+
+        # Panel de trabajo a la derecha (tabs simples: Editor y NodeView)
+        self.work_tabs = QtWidgets.QTabWidget(self)
+        self.work_tabs.setDocumentMode(True)
+        self.work_tabs.setTabPosition(QtWidgets.QTabWidget.North)
+        self.outer_splitter.addWidget(self.work_tabs)
+
+        # Editor de texto básico
+        self.text_editor = QtWidgets.QPlainTextEdit(self)
+        self.text_editor.setPlaceholderText("Editor de texto")
+        self.work_tabs.addTab(self.text_editor, "Editor")
+
+        # NodeView o placeholder dentro de un contenedor con barra inferior propia
+        self.node_view = _load_node_view(self)
+        self.node_tab = QtWidgets.QWidget(self)
+        node_tab_layout = QtWidgets.QVBoxLayout(self.node_tab)
+        node_tab_layout.setContentsMargins(0, 0, 0, 0)
+        node_tab_layout.setSpacing(0)
+        node_tab_layout.addWidget(self.node_view, 1)
+        # Construir barra inferior específica del editor de nodos
+        self._node_bar_container = self._build_node_bottom_bar()
+        node_tab_layout.addWidget(self._node_bar_container, 0)
+        self.work_tabs.addTab(self.node_tab, "Nodos")
+
+        # Enfocar el panel de nodos al activar la pestaña para que TAB funcione
         try:
-            from ..ui.node_inspector import NodeInspector
-            self.node_inspector = NodeInspector()
-        except Exception:
-            self.node_inspector = QWidget()
-        self.node_inspector.setMinimumWidth(220)
-        self.inner_splitter.addWidget(self.node_inspector)
-        try:
-            self.inner_splitter.setSizes([360, 820, 260])
-        except Exception:
-            pass
-        # Colocar el splitter interno dentro del panel principal
-        main_layout = QHBoxLayout(main_panel)
-        main_layout.setContentsMargins(0, 0, 0, 0)
-        main_layout.addWidget(self.inner_splitter)
-        self.outer_splitter.addWidget(main_panel)
-        # Tamaños iniciales: sidebar más estrecha
-        try:
-            self.outer_splitter.setSizes([self._sidebar_last_size, 900])
-        except Exception:
-            pass
-        # --- Barra de íconos global fija al borde izquierdo ---
-        try:
-            # Ocultar barra interna del Explorer si existe
-            if self.file_explorer and hasattr(self.file_explorer, 'set_external_rail'):
-                self.file_explorer.set_external_rail(True)
+            self.work_tabs.currentChanged.connect(self._on_tab_changed)
         except Exception:
             pass
 
-        from PySide6.QtWidgets import QFrame
-        global_bar_width = 48
+        # Central widget
+        self.setCentralWidget(central)
         try:
-            global_bar_width = getattr(self.file_explorer, '_rail_width', 48) or 48
-        except Exception:
-            global_bar_width = 48
-
-        self._activity_bar = QFrame()
-        self._activity_bar.setObjectName("GlobalActivityBar")
-        try:
-            self._activity_bar.setFixedWidth(int(global_bar_width))
-        except Exception:
-            pass
-        # QToolButton ya importado a nivel de módulo
-        from PySide6.QtGui import QIcon
-        bar_layout = QVBoxLayout(self._activity_bar)
-        bar_layout.setContentsMargins(6, 8, 6, 8)
-        bar_layout.setSpacing(10)
-
-        def mk_btn(icon_name: str, tooltip: str) -> QToolButton:
-            btn = QToolButton()
-            try:
-                icon = QIcon.fromTheme(icon_name)
-                if not icon.isNull():
-                    btn.setIcon(icon)
-                else:
-                    # Fallback minimalista si no hay icono del sistema
-                    fallback = {
-                        "folder": "📁",
-                        "system-search": "🔍",
-                        "preferences-system": "⚙",
-                        "view-visible": "👁",
-                        "bug": "🐞",
-                        "wallet": "💼",
-                        "view-grid": "⬛",
-                        "applications-science": "🧪",
-                        "server": "🖥",
-                        "database": "🗄",
-                    }.get(icon_name, "·")
-                    btn.setText(fallback)
-            except Exception:
-                pass
-            btn.setToolTip(tooltip)
-            btn.setIconSize(QSize(20, 20))
-            btn.setAutoRaise(True)
-            btn.setCheckable(True)
-            btn.setCursor(Qt.PointingHandCursor)
-            return btn
-
-        # Botones estilo VS Code
-        self._bar_btn_files = mk_btn("folder", "Archivos")
-        self._bar_btn_search = mk_btn("system-search", "Buscar")
-        self._bar_btn_graph = mk_btn("preferences-system", "Grafo")
-        self._bar_btn_eye = mk_btn("view-visible", "Vista")
-        self._bar_btn_bug = mk_btn("bug", "Depurar")
-        self._bar_btn_wallet = mk_btn("wallet", "Finanzas")
-        self._bar_btn_grid = mk_btn("view-grid", "Cuadrícula")
-        self._bar_btn_lab = mk_btn("applications-science", "Laboratorio")
-        self._bar_btn_server = mk_btn("server", "Servidor")
-        self._bar_btn_db = mk_btn("database", "Datos")
-
-        for btn in (
-            self._bar_btn_files,
-            self._bar_btn_search,
-            self._bar_btn_graph,
-            self._bar_btn_eye,
-            self._bar_btn_bug,
-            self._bar_btn_wallet,
-            self._bar_btn_grid,
-            self._bar_btn_lab,
-            self._bar_btn_server,
-            self._bar_btn_db,
-        ):
-            bar_layout.addWidget(btn)
-        bar_layout.addStretch(1)
-
-        # Grupo exclusivo para resaltar un único botón activo
-        try:
-            self._activity_group = QButtonGroup(self)
-            self._activity_group.setExclusive(True)
-            for btn in (
-                self._bar_btn_files,
-                self._bar_btn_search,
-                self._bar_btn_graph,
-                self._bar_btn_eye,
-                self._bar_btn_bug,
-                self._bar_btn_wallet,
-                self._bar_btn_grid,
-                self._bar_btn_lab,
-                self._bar_btn_server,
-                self._bar_btn_db,
-            ):
-                self._activity_group.addButton(btn)
+            central.setStyleSheet("background: #0f1318;")
         except Exception:
             pass
 
-        # Comportamiento: Files alterna mostrar/ocultar Explorer
-        try:
-            self._bar_btn_files.clicked.connect(self._toggle_sidebar)
-        except Exception:
-            pass
-        try:
-            def _focus_search():
-                try:
-                    self._apply_sidebar(False)
-                    if self.file_explorer and hasattr(self.file_explorer, 'search_bar'):
-                        self.file_explorer.search_bar.setFocus()
-                except Exception:
-                    pass
-            self._bar_btn_search.clicked.connect(_focus_search)
-        except Exception:
-            pass
+        # Status bar (global) minimal, sin controles de Nodos
+        self._setup_status_bar()
+        # Conectar la barra inferior del editor de nodos después de crear NodeView
+        QtCore.QTimer.singleShot(0, self._wire_node_bottom_bar)
 
-        # Menú contextual de carpeta: seleccionar raíz del Explorer
-        try:
-            self._bar_btn_files.setContextMenuPolicy(Qt.CustomContextMenu)
-            def _open_files_menu(pos):
-                try:
-                    menu = QMenu(self)
-                    act_open = menu.addAction("Abrir carpeta…")
-                    act_proj = menu.addAction("Proyecto actual")
-                    act_docs = menu.addAction("Documentos")
-                    act_desktop = menu.addAction("Escritorio")
-                    chosen = menu.exec(self._bar_btn_files.mapToGlobal(pos))
-                    import os
-                    from PySide6.QtCore import QDir
-                    if chosen == act_open:
-                        path = QFileDialog.getExistingDirectory(self, "Elegir carpeta", QDir.homePath())
-                        if path:
-                            if self.file_explorer and hasattr(self.file_explorer, 'set_root'):
-                                self.file_explorer.set_root(path)
-                                self._apply_sidebar(False)
-                    elif chosen == act_proj:
-                        path = QDir.currentPath()
-                        if self.file_explorer and hasattr(self.file_explorer, 'set_root'):
-                            self.file_explorer.set_root(path)
-                            self._apply_sidebar(False)
-                    elif chosen == act_docs:
-                        home = QDir.homePath()
-                        path = os.path.join(home, 'Documents')
-                        if self.file_explorer and hasattr(self.file_explorer, 'set_root'):
-                            self.file_explorer.set_root(path)
-                            self._apply_sidebar(False)
-                    elif chosen == act_desktop:
-                        home = QDir.homePath()
-                        path = os.path.join(home, 'Desktop')
-                        if self.file_explorer and hasattr(self.file_explorer, 'set_root'):
-                            self.file_explorer.set_root(path)
-                            self._apply_sidebar(False)
-                except Exception:
-                    pass
-            self._bar_btn_files.customContextMenuRequested.connect(_open_files_menu)
-        except Exception:
-            pass
+        # Restaurar estado del sidebar
+        self._restore_sidebar_state()
 
-        # Estilo del activity bar global
+        # Asegurar que el Explorer esté listo al inicio
+        QtCore.QTimer.singleShot(0, self._ensure_explorer_ready)
+
+        # Estilos de la barra de actividad y splitter (VS Code-like)
         try:
             self._activity_bar.setStyleSheet(
                 """
-                QWidget#GlobalActivityBar { background: #1b1f27; border-right: 1px solid #2a2f39; }
-                QToolButton { color: #cbd5e1; padding: 6px; }
-                QToolButton:hover { background: #222733; border-radius: 6px; }
-                QToolButton:checked { background: #2a3140; border-radius: 6px; }
+                QFrame#globalActivityBar { background: #141923; border-right: 1px solid #2a2f39; }
+                QToolButton { color: #cbd5e1; padding: 10px 6px; }
+                QToolButton:hover { background: #273041; border-radius: 6px; }
+                QToolButton:checked { background: #324054; border-radius: 6px; }
                 """
             )
-        except Exception:
-            pass
-
-        # Layout central con barra global + splitter principal
-        hbox = QHBoxLayout(central)
-        hbox.setContentsMargins(0, 0, 0, 0)
-        hbox.setSpacing(0)
-        hbox.addWidget(self._activity_bar)
-        hbox.addWidget(self.outer_splitter)
-        self.setCentralWidget(central)
-
-        # Estado inicial: Explorer visible → botón Files activo
-        try:
-            self._bar_btn_files.setChecked(True)
-        except Exception:
-            pass
-
-        # Atajo global: Ctrl+O para seleccionar carpeta del Explorer
-        try:
-            self._shortcut_open_folder = QShortcut(QKeySequence("Ctrl+O"), self)
-            self._shortcut_open_folder.setAutoRepeat(False)
-            def _open_folder_shortcut():
-                try:
-                    start_dir = QDir.currentPath()
-                except Exception:
-                    import os
-                    start_dir = os.getcwd()
-                try:
-                    path = QFileDialog.getExistingDirectory(self, "Seleccionar carpeta", start_dir)
-                    if path and self.file_explorer and hasattr(self.file_explorer, 'set_root'):
-                        self.file_explorer.set_root(path)
-                        # Mostrar Explorer si estaba oculto
-                        self._apply_sidebar(False)
-                        # Resaltar botón Files
-                        try:
-                            self._set_activity_active("files")
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
-            self._shortcut_open_folder.activated.connect(_open_folder_shortcut)
-        except Exception:
-            pass
-
-    def _set_activity_active(self, name: str):
-        """Marca el botón de la barra global como activo por nombre lógico."""
-        try:
-            mapping = {
-                "files": self._bar_btn_files,
-                "search": self._bar_btn_search,
-                "graph": self._bar_btn_graph,
-                "eye": self._bar_btn_eye,
-                "bug": self._bar_btn_bug,
-                "wallet": self._bar_btn_wallet,
-                "grid": self._bar_btn_grid,
-                "lab": self._bar_btn_lab,
-                "server": self._bar_btn_server,
-                "db": self._bar_btn_db,
-            }
-            for key, btn in mapping.items():
-                if btn:
-                    btn.setChecked(key == name)
-        except Exception:
-            pass
-
-        # --- Toolbar ---
-        self._setup_toolbar()
-
-        # --- Status bar ---
-        self._setup_status_bar()
-
-        # Interceptar TAB a nivel global para menú estilo Houdini
-        try:
-            from PySide6.QtWidgets import QApplication
-            QApplication.instance().installEventFilter(self)
-        except Exception:
-            pass
-
-        # --- Timer de edición ---
-        # Se elimina el cierre automático por temporizador para evitar
-        # que el modo edición se "suelte" o cierre inesperadamente.
-        self._editing_timer = None
-
-    # ------------------------------
-    # Toggle minimalista: ocultar/mostrar Explorer
-    # ------------------------------
-    def _toggle_sidebar(self):
-        try:
-            self._apply_sidebar(not self._sidebar_collapsed)
-        except Exception:
-            pass
-
-    def _apply_sidebar(self, compact: bool):
-        try:
-            sizes = self.outer_splitter.sizes()
-            total = sum(sizes) if sizes else 1140
-            if compact:
-                # Guardar último tamaño antes de compactar
-                self._sidebar_last_size = max(180, sizes[0]) if sizes else self._sidebar_last_size
-                if self.file_explorer and hasattr(self.file_explorer, 'set_compact'):
-                    self.file_explorer.set_compact(True)
-                # Con barra externa fija, el panel del Explorer colapsa a 0px
-                left = 0
-                self.outer_splitter.setSizes([left, max(200, total - left)])
-                self._sidebar_collapsed = True
-                # Toolbar no controla el texto de toggle; se usa la barra lateral
-                # Desactivar resaltado de Files cuando está colapsado
-                try:
-                    self._set_activity_active("")
-                except Exception:
-                    pass
-            else:
-                if self.file_explorer and hasattr(self.file_explorer, 'set_compact'):
-                    self.file_explorer.set_compact(False)
-                left = min(self._sidebar_last_size, total - 200)
-                self.outer_splitter.setSizes([left, max(200, total - left)])
-                self._sidebar_collapsed = False
-                # Toolbar no controla el texto de toggle; se usa la barra lateral
-                # Activar resaltado de Files cuando está visible
-                try:
-                    self._set_activity_active("files")
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-    # ------------------------------
-    # Abrir archivo del Explorer como nodo
-    # ------------------------------
-    def _on_file_opened(self, file_path: str):
-        try:
-            # Leer contenido del archivo
-            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                text = f.read()
-        except Exception as e:
-            QMessageBox.warning(self, "Error", f"No se pudo abrir el archivo:\n{e}")
-            return
-
-        # Crear nodo en el centro de la vista con nombre del archivo
-        try:
-            import os
-            title = os.path.basename(file_path)
-            center = self.node_view.mapToScene(self.node_view.viewport().rect().center())
-            node = self.node_view.add_node_with_ports(
-                title=title,
-                x=center.x(),
-                y=center.y(),
-                node_type="input",
-                inputs=["input"],
-                outputs=["output"],
-                content=text,
+            self.outer_splitter.setStyleSheet(
+                """
+                QSplitter::handle { background: #11151b; width: 3px; }
+                QSplitter::handle:hover { background: #1f2430; }
+                """
             )
-            node.setSelected(True)
-            self.node_view.centerOn(node)
+            self.work_tabs.setStyleSheet(
+                """
+                QTabBar::tab { background: #131820; color: #cbd5e1; padding: 6px 12px; margin-right: 2px; }
+                QTabBar::tab:selected { background: #1b2230; }
+                QTabBar::tab:hover { background: #1a202a; }
+                QTabWidget::pane { border-top: 1px solid #202a36; }
+                """
+            )
+            # Status bar coherente
+            self.statusBar().setStyleSheet("background:#0f1318;color:#cbd5e1;")
         except Exception:
-            # Fallback mínimo
-            self.node_view.add_node(title=title, x=0, y=0, node_type="generic", content=text)
+            pass
 
     # -----------------------------
-    # Node Controller
-    # ------------------------------
-    def set_node_controller(self, controller):
-        """Establece el controlador de nodos."""
-        self._node_controller = controller
-        logger.info("Controlador de nodos establecido")
+    # Construcción de subcomponentes
+    # -----------------------------
+    def _build_activity_bar(self) -> QtWidgets.QWidget:
+        bar = QtWidgets.QFrame(self)
+        bar.setObjectName("globalActivityBar")
+        bar.setFixedWidth(48)
+        bar.setFrameShape(QtWidgets.QFrame.NoFrame)
 
-    # ------------------------------
-    # NodeView dinámico
-    # ------------------------------
-    def _load_node_view(self):
+        layout = QtWidgets.QVBoxLayout(bar)
+        layout.setContentsMargins(0, 8, 0, 8)
+        layout.setSpacing(6)
+
+        # Botón carpeta
+        self._btn_files = QtWidgets.QToolButton(bar)
+        self._btn_files.setCheckable(True)
+        self._btn_files.setToolTip("Explorador de carpetas")
+        self._btn_files.setIcon(self.style().standardIcon(QtWidgets.QStyle.SP_DirIcon))
+        self._btn_files.setIconSize(QtCore.QSize(24, 24))
+        # Usamos toggled para comportamiento de mostrar/ocultar con animación
+        self._btn_files.toggled.connect(self._on_files_toggled)
+
+        # Menú contextual del botón
+        menu = QtWidgets.QMenu(self._btn_files)
+        act_open = menu.addAction("Abrir carpeta...")
+        act_open.triggered.connect(self._action_open_folder)
+        self._btn_files.setMenu(menu)
+        self._btn_files.setPopupMode(QtWidgets.QToolButton.MenuButtonPopup)
+
+        layout.addWidget(self._btn_files)
+        layout.addStretch(1)
+        return bar
+
+    def _build_file_explorer(self) -> QtWidgets.QWidget:
+        if FileExplorer is None:
+            # Fallback si no se pudo importar: mensaje amigable y botón para reintentar
+            container = QtWidgets.QWidget(self)
+            v = QtWidgets.QVBoxLayout(container)
+            v.setContentsMargins(8, 8, 8, 8)
+            v.setSpacing(8)
+            lbl = QtWidgets.QLabel("FileExplorer no disponible")
+            lbl.setAlignment(QtCore.Qt.AlignCenter)
+            lbl.setStyleSheet("color:#cbd5e1;font-size:13px;")
+            v.addStretch(1)
+            v.addWidget(lbl)
+            btn = QtWidgets.QPushButton("Reintentar carga")
+            btn.clicked.connect(self._retry_load_explorer)
+            btn.setFixedWidth(160)
+            btn.setStyleSheet("padding:6px 10px;border-radius:6px;")
+            h = QtWidgets.QHBoxLayout()
+            h.addStretch(1)
+            h.addWidget(btn)
+            h.addStretch(1)
+            v.addLayout(h)
+            v.addStretch(1)
+            return container
+
         try:
-            from ..graph.node_view import NodeView
-            node_view = NodeView()
-            node_view.selectedNodeChanged.connect(self.on_node_selected)
-            node_view.editNodeRequested.connect(self.start_edit_node)
-            # Sincronizar salida de edición desde el botón dentro del nodo
-            node_view.editingExited.connect(self._on_node_edit_exited)
-            logger.info("NodeView cargado correctamente")
-            return node_view
+            explorer = FileExplorer()
+            return explorer
         except Exception as e:
-            logger.exception("No se pudo cargar NodeView: %s", e)
-            placeholder = QTextEdit()
-            placeholder.setReadOnly(True)
-            placeholder.setPlainText(
-                f"NodeView no disponible.\n\nRazón:\n{e}\n\nRevisa editor.log para más detalles."
-            )
-            placeholder.setMinimumSize(400, 300)
-            return placeholder
+            print(f"[EditorWindow] Error instanciando FileExplorer: {e}")
+            container = QtWidgets.QWidget(self)
+            v = QtWidgets.QVBoxLayout(container)
+            v.setContentsMargins(8, 8, 8, 8)
+            v.addStretch(1)
+            msg = QtWidgets.QLabel("No se pudo crear el FileExplorer")
+            msg.setAlignment(QtCore.Qt.AlignCenter)
+            v.addWidget(msg)
+            v.addStretch(1)
+            return container
 
-    # ------------------------------
-    # Toolbar
-    # ------------------------------
-    def _setup_toolbar(self):
-        # Evitar duplicar la barra si ya existe
-        existing = getattr(self, "_main_toolbar", None)
-        if existing:
-            try:
-                self.removeToolBar(existing)
-            except Exception:
-                pass
-        toolbar = QToolBar("Main")
-        self.addToolBar(toolbar)
-        self._main_toolbar = toolbar
+    def _retry_load_explorer(self) -> None:
+        # Reintentar import e inserción en el splitter
+        global FileExplorer
+        FileExplorer = _import_file_explorer()
+        idx = self.outer_splitter.indexOf(self.file_explorer)
+        if idx != -1:
+            # Reemplazar el widget en el splitter
+            self.outer_splitter.widget(idx).deleteLater()
+            self.file_explorer = self._build_file_explorer()
+            self.outer_splitter.insertWidget(idx, self.file_explorer)
+        self._ensure_explorer_ready()
 
-        edit_toggle = QAction("Editar nodo", self)
-        edit_toggle.setShortcut("Ctrl+E")
-        edit_toggle.triggered.connect(self.toggle_edit_mode)
-        toolbar.addAction(edit_toggle)
-        self._edit_toggle_action = edit_toggle
-
-        save_action = QAction("Guardar nodo", self)
-        save_action.setShortcut("Ctrl+S")
-        save_action.triggered.connect(self.save_node_from_editor)
-        toolbar.addAction(save_action)
-        
-        save_proj = QAction("Guardar proyecto", self)
-        save_proj.triggered.connect(self.save_project)
-        toolbar.addAction(save_proj)
-
-        load_proj = QAction("Cargar proyecto", self)
-        load_proj.triggered.connect(self.load_project)
-        toolbar.addAction(load_proj)
-
-        # Atajo para ampliar la última ventana de conexión
-        expand_conn = QAction("Ampliar conexión reciente", self)
-        expand_conn.setShortcut("Ctrl+M")
-        expand_conn.triggered.connect(self._expand_last_connection_editor)
-        toolbar.addAction(expand_conn)
-
-        # El toggle del Explorer se controla desde la barra de actividad izquierda
-
-        # Toggle Minimapa
-        minimap_toggle = QAction("Minimapa", self)
-        minimap_toggle.setCheckable(True)
-        minimap_toggle.setChecked(True)
-        minimap_toggle.setShortcut("N")
-        minimap_toggle.triggered.connect(self._toggle_minimap)
-        toolbar.addAction(minimap_toggle)
-        self._minimap_toggle_action = minimap_toggle
-
-    def _expand_last_connection_editor(self):
+    def _setup_status_bar(self) -> None:
+        sb = self.statusBar()
         try:
-            if hasattr(self, "node_view") and self.node_view:
-                self.node_view.open_last_connection_editor(expand=True)
+            sb.setStyleSheet("background:#0f1318;color:#cbd5e1;")
+            sb.showMessage("Listo")
         except Exception:
-            logger.exception("No se pudo ampliar la última ventana de conexión")
+            pass
 
-    def _toggle_minimap(self):
+    def _build_node_bottom_bar(self) -> QtWidgets.QWidget:
+        """Construye la barra inferior específica del editor de nodos."""
+        container = QtWidgets.QFrame(self)
+        container.setFrameShape(QtWidgets.QFrame.StyledPanel)
+        container.setStyleSheet("background:#0f1318;border-top:1px solid #202a36;")
+
+        lay = QtWidgets.QHBoxLayout(container)
+        lay.setContentsMargins(8, 4, 8, 4)
+        lay.setSpacing(10)
+
+        # Estado: selección y zoom
+        self._lbl_sel = QtWidgets.QLabel("Sel: 0", container)
+        self._lbl_zoom = QtWidgets.QLabel("Zoom: 100%", container)
+        for lbl in (self._lbl_sel, self._lbl_zoom):
+            lbl.setStyleSheet("color:#cbd5e1;")
+        lay.addWidget(self._lbl_sel)
+        lay.addWidget(self._lbl_zoom)
+
+        lay.addStretch(1)
+
+        # Botones de acciones
+        def _mk_btn(text: str) -> QtWidgets.QPushButton:
+            b = QtWidgets.QPushButton(text, container)
+            b.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
+            b.setMinimumHeight(26)
+            b.setStyleSheet(
+                """
+                QPushButton { background:#1b2230; color:#cbd5e1; border:1px solid #202a36; padding:4px 12px; border-radius:6px; }
+                QPushButton:hover { background:#232a3a; }
+                QPushButton:pressed { background:#192133; }
+                """
+            )
+            return b
+
+        self._btn_add = _mk_btn("Añadir…")
+        self._btn_frame = _mk_btn("Frame")
+        self._btn_eval = _mk_btn("Evaluar")
+        self._btn_zoom_out = _mk_btn("Zoom −")
+        self._btn_zoom_in = _mk_btn("Zoom +")
+        self._btn_zoom_reset = _mk_btn("Reset")
+        self._btn_layout = _mk_btn("Auto layout")
+        self._btn_delete = _mk_btn("Eliminar selección")
+        self._btn_blueprint = _mk_btn("Editar en ventana…")
+        self._btn_output_preview = _mk_btn("Preview Outputs…")
+
+        lay.addWidget(self._btn_add)
+        lay.addWidget(self._btn_frame)
+        lay.addWidget(self._btn_eval)
+        lay.addSpacing(6)
+        lay.addWidget(self._btn_zoom_out)
+        lay.addWidget(self._btn_zoom_in)
+        lay.addWidget(self._btn_zoom_reset)
+        lay.addSpacing(6)
+        lay.addWidget(self._btn_layout)
+        lay.addWidget(self._btn_delete)
+        lay.addWidget(self._btn_blueprint)
+        lay.addWidget(self._btn_output_preview)
+
+        return container
+
+    # -----------------------------
+    # Acciones de UI
+    # -----------------------------
+    def _on_files_toggled(self, checked: bool) -> None:
+        # Mostrar/ocultar con animación al estilo VS Code
+        self._animate_sidebar(expand=checked)
+        if checked:
+            self._ensure_explorer_ready()
+
+    def _action_open_folder(self) -> None:
+        path = QtWidgets.QFileDialog.getExistingDirectory(self, "Seleccionar carpeta")
+        if not path:
+            return
+        self._set_explorer_root(path)
+        self._apply_sidebar(expand=True)
+        self._ensure_explorer_ready()
+
+    # -----------------------------
+    # Lógica Explorer / Sidebar
+    # -----------------------------
+    def _ensure_explorer_ready(self) -> None:
+        """Garantiza que el Explorer esté visible, con árbol expandido y foco."""
+        if not hasattr(self, "file_explorer") or self.file_explorer is None:
+            return
+
+        # Forzar visibilidad del contenedor izquierdo (sin animación al inicio)
+        self._apply_sidebar(expand=True)
+
+        # Activar sección Folder si existe
         try:
-            if hasattr(self, 'node_view') and hasattr(self.node_view, '_minimap') and self.node_view._minimap is not None:
-                vis = self.node_view._minimap.isVisible()
-                self.node_view._minimap.setVisible(not vis)
-                if not vis:
+            if hasattr(self.file_explorer, "folder_toggle_btn"):
+                self.file_explorer.folder_toggle_btn.setChecked(True)
+            if hasattr(self.file_explorer, "set_compact_mode"):
+                self.file_explorer.set_compact_mode(True)
+        except Exception:
+            pass
+
+        # Asegurar raíz válida
+        has_root = False
+        try:
+            # FileExplorer expone root_path
+            root_path = getattr(self.file_explorer, "root_path", None)
+            has_root = bool(root_path)
+        except Exception:
+            has_root = False
+
+        if not has_root:
+            # Intentar restaurar última carpeta usada
+            last_path = self._settings.value("explorer/last_root", "", type=str) or ""
+            if last_path:
+                self._set_explorer_root(last_path)
+            else:
+                self._set_explorer_root(QtCore.QDir.homePath())
+
+        # Asegurar foco al árbol si existe
+        try:
+            tree = getattr(self.file_explorer, "tree", None)
+            if tree is not None:
+                tree.setVisible(True)
+                tree.setFocus()
+        except Exception:
+            pass
+
+    def _animate_sidebar(self, expand: bool) -> None:
+        """Anima el ancho del panel izquierdo para mostrar/ocultar el Explorer."""
+        try:
+            sizes = self.outer_splitter.sizes()
+            total = sum(sizes) if sizes else max(self.width(), 1)
+            current_left = sizes[0] if sizes else 0
+            target_left = (
+                max(90, min(self._sidebar_last_size, total - 100)) if expand else 0
+            )
+
+            class _SplitterSizeProxy(QtCore.QObject):
+                def __init__(self, splitter: QtWidgets.QSplitter):
+                    super().__init__(splitter)
+                    self._splitter = splitter
+                    self._width = current_left
+
+                def getWidth(self) -> int:
+                    return int(self._width)
+
+                def setWidth(self, w: int) -> None:
+                    self._width = int(max(0, w))
                     try:
-                        self.node_view._update_minimap_fit()
-                        self.node_view._layout_minimap()
+                        sizes = self._splitter.sizes()
+                        total = sum(sizes) if sizes else 0
+                        left = self._width
+                        right = max(100, total - left) if total > 0 else 500
+                        self._splitter.setSizes([left, right])
                     except Exception:
                         pass
-        except Exception:
-            logger.exception("No se pudo alternar el minimapa")
 
-    # ------------------------------
-    # Status bar estilo VS Code
-    # ------------------------------
-    def _setup_status_bar(self):
+                width = QtCore.Property(int, getWidth, setWidth)
+
+            proxy = _SplitterSizeProxy(self.outer_splitter)
+            anim = QtCore.QPropertyAnimation(proxy, b"width", self)
+            anim.setDuration(220)
+            anim.setStartValue(current_left)
+            anim.setEndValue(target_left)
+            anim.setEasingCurve(QtCore.QEasingCurve.InOutCubic)
+
+            # Animación de opacidad del Explorer para un efecto más suave
+            try:
+                if hasattr(self.file_explorer, "animate_visibility"):
+                    self.file_explorer.animate_visibility(expand)
+            except Exception:
+                pass
+
+            def _finish():
+                # Persistir estado y tamaños finales
+                self._sidebar_collapsed = not expand
+                final_sizes = self.outer_splitter.sizes()
+                if final_sizes and final_sizes[0] > 0:
+                    self._sidebar_last_size = final_sizes[0]
+                self._save_sidebar_state()
+
+            anim.finished.connect(_finish)
+            anim.start()
+        except Exception:
+            # Fallback sin animación
+            self._apply_sidebar(expand=expand)
+
+    def _apply_sidebar(self, expand: bool) -> None:
+        """Expande/colapsa el panel izquierdo (Explorer) y persiste su tamaño."""
+        self._sidebar_collapsed = not expand
+        sizes = self.outer_splitter.sizes()
+        total = sum(sizes) if sizes else max(self.width(), 1)
+
+        if expand:
+            # Usar último ancho conocido, permitiendo panel mucho más estrecho
+            left = max(90, min(self._sidebar_last_size, total - 220))
+            right = max(200, total - left)
+            self.outer_splitter.setSizes([left, right])
+        else:
+            # Colapsar completamente el panel izquierdo
+            self._sidebar_last_size = sizes[0] if sizes else self._sidebar_last_size
+            self.outer_splitter.setSizes([0, total])
+
+        self._save_sidebar_state()
+
+    def _set_explorer_root(self, path: str) -> None:
         try:
-            status = QStatusBar(self)
-            self.setStatusBar(status)
-            self._lbl_zoom = QLabel("Zoom: 100%")
-            self._lbl_sel = QLabel("Selección: 0")
-            self._lbl_mode = QLabel("Modo: lectura")
-            for w in (self._lbl_zoom, self._lbl_sel, self._lbl_mode):
-                w.setStyleSheet("color: #a0a6b0; padding: 0 8px;")
-                status.addPermanentWidget(w)
-            # Conectar señales desde la vista
+            if hasattr(self.file_explorer, "set_root"):
+                self.file_explorer.set_root(path)
+                self._settings.setValue("explorer/last_root", path)
+        except Exception:
+            pass
+
+    # -----------------------------
+    # Persistencia de UI
+    # -----------------------------
+    def _restore_sidebar_state(self) -> None:
+        collapsed = self._settings.value("sidebar/collapsed", False, type=bool)
+        last_size = self._settings.value("sidebar/last_size", 140, type=int)
+        self._sidebar_collapsed = collapsed
+        self._sidebar_last_size = max(90, int(last_size))
+
+        # Ajustar tamaños iniciales
+        if self._sidebar_collapsed:
+            self.outer_splitter.setSizes([0, self.width()])
+            self._btn_files.setChecked(False)
+        else:
+            left = self._sidebar_last_size
+            total = max(self.width(), 1)
+            right = max(200, total - left)
+            self.outer_splitter.setSizes([left, right])
+            self._btn_files.setChecked(True)
+
+    def _save_sidebar_state(self) -> None:
+        sizes = self.outer_splitter.sizes()
+        if sizes and sizes[0] > 0:
+            self._sidebar_last_size = sizes[0]
+        self._settings.setValue("sidebar/collapsed", self._sidebar_collapsed)
+        self._settings.setValue("sidebar/last_size", self._sidebar_last_size)
+
+    # -----------------------------
+    # Eventos de ventana
+    # -----------------------------
+    def closeEvent(self, event: QtGui.QCloseEvent) -> None:  # noqa: N802
+        self._save_sidebar_state()
+        super().closeEvent(event)
+
+    # -----------------------------
+    # API esperada por main.py / controlador de nodos
+    # -----------------------------
+
+    def _on_tab_changed(self, index: int) -> None:
+        """Enfoca el NodeView cuando se activa la pestaña 'Nodos'."""
+        try:
+            widget = self.work_tabs.widget(index)
+            if widget is self.node_tab:
+                # Dar foco para que keyPressEvent (TAB) sea capturado
+                self.node_view.setFocus()
+                # Asegurar que el grafo demo aparezca si la escena está vacía
+                try:
+                    if hasattr(self.node_view, 'ensure_demo_graph'):
+                        self.node_view.ensure_demo_graph()
+                except Exception:
+                    pass
+                # Actualizar estado visible
+                self._refresh_node_status_widgets()
+        except Exception:
+            pass
+
+    def _wire_node_bottom_bar(self) -> None:
+        """Conecta señales del NodeView con la barra inferior del editor de nodos."""
+        try:
+            if not hasattr(self, 'node_view') or self.node_view is None:
+                return
+            # Actualizar etiquetas en tiempo real
             try:
                 self.node_view.zoomChanged.connect(self._on_zoom_changed)
                 self.node_view.selectionCountChanged.connect(self._on_selection_count)
+                self.node_view.graphEvaluated.connect(self._on_graph_evaluated)
+                # Abrir editor de nodo en ventana independiente al hacer doble clic
+                if hasattr(self.node_view, 'editNodeRequested'):
+                    self.node_view.editNodeRequested.connect(self._on_edit_node_requested)
             except Exception:
                 pass
+            # Acciones rápidas
+            self._btn_add.clicked.connect(self.node_view.open_tab_menu)
+            self._btn_frame.clicked.connect(self.node_view.center_on_selected)
+            self._btn_eval.clicked.connect(self.node_view.evaluate_graph)
+            self._btn_zoom_out.clicked.connect(self.node_view.zoom_out)
+            self._btn_zoom_in.clicked.connect(self.node_view.zoom_in)
+            self._btn_zoom_reset.clicked.connect(self.node_view.reset_zoom)
+            self._btn_layout.clicked.connect(self.node_view.auto_layout_selection)
+            self._btn_delete.clicked.connect(self.node_view.delete_selected_nodes)
+            self._btn_blueprint.clicked.connect(self._open_blueprint_window)
+            self._btn_output_preview.clicked.connect(self._open_output_preview)
+            # Primer refresco
+            self._refresh_node_status_widgets()
         except Exception:
             pass
 
-    def _on_zoom_changed(self, scale_x: float):
+    def _on_zoom_changed(self, scale: float) -> None:
         try:
-            pct = int(max(1.0, scale_x) * 100)
-            self._lbl_zoom.setText(f"Zoom: {pct}%")
+            pct = int(round(scale * 100))
+        except Exception:
+            pct = 100
+        self._lbl_zoom.setText(f"Zoom: {pct}%")
+
+    def _on_selection_count(self, count: int) -> None:
+        self._lbl_sel.setText(f"Sel: {int(count)}")
+
+    def _on_graph_evaluated(self) -> None:
+        try:
+            self.statusBar().showMessage("Grafo evaluado", 1500)
         except Exception:
             pass
 
-    def _on_selection_count(self, count: int):
+    def _refresh_node_status_widgets(self) -> None:
+        """Refresca etiquetas de estado con valores actuales de NodeView."""
         try:
-            self._lbl_sel.setText(f"Selección: {int(count)}")
+            # Simular señales para estado inicial
+            selected = len(self.node_view._scene.selectedItems()) if hasattr(self.node_view, '_scene') else 0
+            self._on_selection_count(selected)
+            scale = float(self.node_view.transform().m11()) if hasattr(self.node_view, 'transform') else 1.0
+            self._on_zoom_changed(scale)
+        except Exception:
+            pass
+    def set_node_controller(self, controller: object) -> None:
+        """Permite inyectar el controlador de nodos desde main.py."""
+        self._node_controller = controller
+        # Si el NodeView soporta set_controller, propagarlo
+        try:
+            if hasattr(self.node_view, "set_controller"):
+                self.node_view.set_controller(controller)  # type: ignore[attr-defined]
         except Exception:
             pass
 
-    # ------------------------------
-    # Nodo seleccionado
-    # ------------------------------
-    def on_node_selected(self, node):
-        """Cuando se selecciona un nodo, cargar su contenido en el editor."""
-        # Guardar cambios del nodo anterior si existe
-        if self.current_node and hasattr(self.current_node, 'update_from_text'):
-            try:
-                # No hacer commit para nodos Output: su contenido lo controla el runtime/snapshot
-                prev_type = str(getattr(self.current_node, 'node_type', '')).lower()
-                if prev_type != 'output':
-                    current_text = self.text_editor.toPlainText()
-                    self.current_node.update_from_text(current_text)
-            except Exception:
-                pass
-
-        # Desconectar editor incrustado previo si existía
-        self._disconnect_inline_editor_signals()
-
-        # Si no hay nodo, limpiar
-        if node is None:
-            self.on_node_deselected()
-            return
-
-        # Establecer nuevo nodo actual
-        self.current_node = node
-        self._clear_previous_node()
-        self._current_node = node
-        self._editing_mode = False
-        
-        # Mostrar contenido del nodo en modo sólo lectura
-        self._updating_text = True
+    def _open_blueprint_window(self) -> None:
+        """Abre la ventana independiente tipo Blueprint para editar el grafo actual."""
         try:
-            content = node.to_plain_text() if hasattr(node, 'to_plain_text') else getattr(node, 'content', '')
-            self.text_editor.setPlainText(content)
-        except Exception:
-            self.text_editor.setPlainText(getattr(node, 'content', ''))
-        self.text_editor.setReadOnly(True)
-        self.text_editor.setEnabled(True)
-        # Actualizar barra de vista previa compacta
-        try:
-            self._update_preview_bar(node)
-        except Exception:
-            pass
-        # Mantener sincronizada la pestaña de Outputs al cambiar la selección
-        try:
-            self._schedule_update_outputs()
-        except Exception:
-            pass
-        self.setWindowTitle(f"Seleccionado: {getattr(node, 'title', 'Node')}")
-        self._updating_text = False
-        # Actualizar texto de acción
-        if hasattr(self, "_edit_toggle_action"):
-            self._edit_toggle_action.setText("Editar nodo")
-        # Actualizar Inspector
-        try:
-            if hasattr(self, "node_inspector") and self.node_inspector:
-                self.node_inspector.set_node(node)
+            initial = {}
+            if hasattr(self.node_view, 'export_graph'):
+                initial = self.node_view.export_graph()  # type: ignore[attr-defined]
+            bp = BlueprintEditorWindow(initial_graph=initial, parent=self)
+            # Cuando el usuario guarda en la ventana Blueprint, importar cambios
+            bp.graphSaved.connect(lambda data: self._apply_blueprint_changes(data))
+            bp.show()
         except Exception:
             pass
 
-    def on_node_deselected(self):
-        """Cuando se deselecciona un nodo, limpia el editor."""
-        # Guardar cambios del nodo anterior si existe
-        if self.current_node and hasattr(self.current_node, 'update_from_text'):
-            try:
-                prev_type = str(getattr(self.current_node, 'node_type', '')).lower()
-                if prev_type != 'output':
-                    current_text = self.text_editor.toPlainText()
-                    self.current_node.update_from_text(current_text)
-            except Exception:
-                pass
-        
-        # Limpiar nodo actual
-        self.current_node = None
-        self.text_editor.setPlainText('')
-        self.text_editor.setEnabled(False)
+    def _apply_blueprint_changes(self, data: dict) -> None:
         try:
-            if hasattr(self, "node_inspector") and self.node_inspector:
-                self.node_inspector.set_node(None)
-        except Exception:
-            pass
-        # Refrescar pestaña Outputs aunque no haya selección
-        try:
-            self._schedule_update_outputs()
-        except Exception:
-            pass
-
-    def _clear_previous_node(self):
-        if self._current_node and hasattr(self._current_node, "set_editing"):
-            try:
-                self._current_node.set_editing(False)
-            except Exception:
-                pass
-        self._disconnect_inline_editor_signals()
-
-    def _update_text_editor_preview(self):
-        """Mantener compatibilidad: muestra el contenido actual en modo lectura."""
-        self._updating_text = True
-        if self._current_node is None:
-            self.text_editor.clear()
-            self.text_editor.setReadOnly(True)
-            self.text_editor.setEnabled(False)
-            self.setWindowTitle("Editor de Texto y Nodos")
-            try:
-                if hasattr(self, 'preview_selected'):
-                    self.preview_selected.clear()
-                if hasattr(self, 'preview_outputs'):
-                    self.preview_outputs.clear()
-            except Exception:
-                pass
-        else:
-            try:
-                content = self._current_node.to_plain_text() if hasattr(self._current_node, 'to_plain_text') else getattr(self._current_node, 'content', '')
-                self.text_editor.setPlainText(content)
-            except Exception:
-                self.text_editor.setPlainText(getattr(self._current_node, 'content', ''))
-            self.text_editor.setReadOnly(True)
-            self.text_editor.setEnabled(True)
-            try:
-                self._update_preview_bar(self._current_node)
-                self._schedule_update_outputs()
-            except Exception:
-                pass
-            self.setWindowTitle(f"Seleccionado: {getattr(self._current_node, 'title', 'Node')}")
-        self._updating_text = False
-
-    def _update_preview_bar(self, node):
-        """Actualiza el visor inferior con la vista previa de Selección."""
-        try:
-            if node is None:
-                if hasattr(self, 'preview_selected'):
-                    self.preview_selected.clear()
-                elif hasattr(self, 'preview_bar'):
-                    self.preview_bar.clear()
-                return
-            content = node.to_plain_text() if hasattr(node, 'to_plain_text') else getattr(node, 'content', '')
-            target = getattr(self, 'preview_selected', None)
-            if target is None:
-                target = getattr(self, 'preview_bar', None)
-            if target:
-                target.setPlainText(content or "")
-        except Exception:
-            try:
-                target = getattr(self, 'preview_selected', None)
-                if target is None:
-                    target = getattr(self, 'preview_bar', None)
-                if target:
-                    target.setPlainText(getattr(node, 'content', ''))
-            except Exception:
-                pass
-
-    def _update_outputs_tab(self):
-        """Combina el contenido de todos los nodos Output y lo muestra en pestaña Outputs."""
-        try:
-            target = getattr(self, 'preview_outputs', None)
-            if target is None:
-                return
-            if not hasattr(self.node_view, '_scene'):
-                target.clear()
-                return
-            # Importante: no reevaluar aquí para evitar recursión con la señal graphEvaluated
-            # Modo: combinar todos los nodos vs sólo outputs
-            combine_all = False
-            try:
-                combine_all = bool(getattr(self, '_combine_all_mode', False) or (getattr(self, '_combine_all_toggle', None) and self._combine_all_toggle.isChecked()))
-            except Exception:
-                combine_all = False
-            # Modo: por camino al Output seleccionado
-            combine_by_path = False
-            try:
-                combine_by_path = bool(getattr(self, '_combine_by_path_toggle', None) and self._combine_by_path_toggle.isChecked())
-            except Exception:
-                combine_by_path = False
-            parts = []
-            items = []
-            if combine_by_path:
-                # Buscar Output seleccionado o el primero
-                out_node = self._find_selected_output_or_first()
-                if out_node is not None:
-                    # En modo camino, mostrar directamente el valor que LLEGA al Output
-                    final_text = self._get_node_display_text(out_node, prefer_input_for_output=True)
-                    parts = [str(final_text)] if final_text else []
-                    items = []
-            if not items:
-                # Fallback según modos existentes
-                items = [it for it in self.node_view._scene.items() if isinstance(it, NodeItem)]
+            if hasattr(self.node_view, 'import_graph'):
+                self.node_view.import_graph(data, clear=True)  # type: ignore[attr-defined]
+                # Feedback global
                 try:
-                    items.sort(key=lambda it: getattr(it, 'pos')().x() if hasattr(it, 'pos') else 0.0)
-                except Exception:
-                    pass
-            for it in items:
-                try:
-                    if getattr(it, 'is_snapshot', False):
-                        continue
-                    txt = self._get_node_display_text(it, prefer_input_for_output=False)
-                    if txt:
-                        parts.append(str(txt))
-                except Exception:
-                    pass
-            combined = "\n".join(parts)
-            # Evitar trabajo de UI si el texto no cambió
-            if getattr(self, '_last_outputs_text', None) != combined:
-                self._last_outputs_text = combined
-                try:
-                    prev_upd = target.updatesEnabled()
-                    target.setUpdatesEnabled(False)
-                except Exception:
-                    prev_upd = True
-                prev_block = False
-                try:
-                    prev_block = target.blockSignals(True)
-                except Exception:
-                    pass
-                try:
-                    target.setPlainText(combined)
-                finally:
-                    try:
-                        target.blockSignals(prev_block)
-                    except Exception:
-                        pass
-                    try:
-                        target.setUpdatesEnabled(prev_upd)
-                    except Exception:
-                        pass
-            # Si el usuario activó "Combinar todo", reflejar en un nodo Output dedicado
-            try:
-                if combine_all or combine_by_path:
-                    # Evitar trabajo si no hay cambios
-                    if getattr(self, '_last_combined_text', None) != combined:
-                        self._last_combined_text = combined
-                        self._sync_combined_to_output_node(combined)
-            except Exception:
-                pass
-        except Exception:
-            try:
-                getattr(self, 'preview_outputs', QTextEdit()).clear()
-            except Exception:
-                pass
-
-    def _on_combine_all_toggled(self, checked: bool):
-        try:
-            self._combine_all_mode = bool(checked)
-            self._schedule_update_outputs()
-        except Exception:
-            pass
-
-    def _sync_combined_to_output_node(self, combined_text: str):
-        """Refleja el texto combinado en un nodo Output con título 'Output Combined'.
-        Si no existe, crea uno como snapshot y lo centra.
-        """
-        try:
-            if not hasattr(self.node_view, '_scene'):
-                return
-            # Buscar nodo Output con título específico
-            target_node = None
-            for it in self.node_view._scene.items():
-                try:
-                    if str(getattr(it, 'node_type', '')).lower() == 'output' and str(getattr(it, 'title', '')) == 'Output Combined':
-                        target_node = it
-                        break
-                except Exception:
-                    pass
-            if target_node is None:
-                # Crear uno nuevo centrado
-                center = self.node_view.mapToScene(self.node_view.viewport().rect().center())
-                target_node = self.node_view.add_node(title="Output Combined", x=center.x(), y=center.y(), node_type="output", content=combined_text)
-                try:
-                    setattr(target_node, 'is_snapshot', True)
-                    if hasattr(target_node, '_refresh_title_text'):
-                        target_node._refresh_title_text()
-                except Exception:
-                    pass
-                target_node.setSelected(True)
-                self.node_view.centerOn(target_node)
-            else:
-                # Actualizar contenido del existente, manteniendo snapshot
-                try:
-                    if hasattr(target_node, 'update_from_text'):
-                        target_node.update_from_text(combined_text)
-                    else:
-                        target_node.content = combined_text
-                except Exception:
-                    pass
-                try:
-                    setattr(target_node, 'is_snapshot', True)
-                    if hasattr(target_node, '_refresh_title_text'):
-                        target_node._refresh_title_text()
+                    self.statusBar().showMessage("Grafo actualizado desde Blueprint", 1500)
                 except Exception:
                     pass
         except Exception:
             pass
 
-    def _schedule_update_outputs(self):
+    # -----------------------------
+    # Editor de Nodo (ventana)
+    # -----------------------------
+    def _on_edit_node_requested(self, node) -> None:
         try:
-            timer = getattr(self, '_outputs_update_timer', None)
-            if timer:
-                # Leading-edge: primera actualización inmediata, luego throttle
-                if not timer.isActive():
-                    try:
-                        self._update_outputs_tab()
-                    except Exception:
-                        pass
-                timer.start()
-            else:
-                self._update_outputs_tab()
-        except Exception:
-            try:
-                self._update_outputs_tab()
-            except Exception:
-                pass
-
-    def _schedule_evaluate_graph(self):
-        try:
-            timer = getattr(self, '_graph_eval_timer', None)
-            if timer:
-                # Leading-edge: evaluar inmediatamente si no hay otro en curso
-                if not timer.isActive():
-                    try:
-                        self._evaluate_graph_safe()
-                    except Exception:
-                        pass
-                timer.start()
-            else:
-                self._evaluate_graph_safe()
-        except Exception:
-            self._evaluate_graph_safe()
-
-    def _evaluate_graph_safe(self):
-        try:
-            if hasattr(self, 'node_view') and self.node_view:
-                self.node_view.evaluate_graph()
+            win = NodeContentEditorWindow(self.node_view, parent=self)
+            win.set_node(node)
+            win.show()
         except Exception:
             pass
 
-    def _find_selected_output_or_first(self):
+    # -----------------------------
+    # Preview de Outputs (ventana)
+    # -----------------------------
+    def _open_output_preview(self) -> None:
         try:
-            # Preferir Output seleccionado
-            selected = []
+            # Mantener referencia para evitar GC y reutilizar ventana
+            if not hasattr(self, '_output_preview_win') or self._output_preview_win is None:
+                self._output_preview_win = OutputPreviewWindow(self.node_view, parent=self)
+            win = self._output_preview_win
+            # Si hay un único nodo seleccionado, crear un Monitor Output autoconectado
             try:
-                selected = [it for it in self.node_view._scene.selectedItems()]
-            except Exception:
-                selected = []
-            for it in selected:
-                try:
-                    if str(getattr(it, 'node_type', '')).lower() == 'output':
-                        return it
-                except Exception:
-                    pass
-            # Buscar primer Output en la escena
-            for it in self.node_view._scene.items():
-                try:
-                    if str(getattr(it, 'node_type', '')).lower() == 'output':
-                        return it
-                except Exception:
-                    pass
-            return None
-        except Exception:
-            return None
-
-    def _collect_upstream_nodes_ordered(self, out_node):
-        """Devuelve nodos conectados aguas arriba del Output en orden de flujo (fuentes → … → Output)."""
-        try:
-            conns = list(getattr(self.node_view, 'connections', []) or [])
-            # BFS inversa desde el Output para obtener profundidad (distancia al Output)
-            depth = {out_node: 0}
-            queue = [out_node]
-            visited = set([out_node])
-            upstream = set()
-            while queue:
-                cur = queue.pop(0)
-                for c in conns:
-                    try:
-                        if getattr(c, 'end_item', None) is cur:
-                            src = getattr(c, 'start_item', None)
-                            if src is None:
-                                continue
-                            upstream.add(src)
-                            if src not in visited:
-                                visited.add(src)
-                                depth[src] = depth.get(cur, 0) + 1
-                                queue.append(src)
-                    except Exception:
-                        pass
-            ordered = list(upstream)
-            try:
-                ordered.sort(key=lambda it: (-depth.get(it, 0), getattr(it, 'pos')().x() if hasattr(it, 'pos') else 0.0))
-            except Exception:
-                ordered.sort(key=lambda it: -depth.get(it, 0))
-            return ordered
-        except Exception:
-            return []
-
-    def _get_node_display_text(self, node, prefer_input_for_output: bool = True):
-        """Devuelve el texto evaluado para mostrar en Outputs.
-
-        - Para `input`, `generic`, `variable`, `process`, usa `output_values` del puerto por defecto.
-        - Para `combine`, idem.
-        - Para `output`, si `prefer_input_for_output` está activo, usa su `input_values` (lo que recibe);
-          si no, y `forward_output` está activo, usa su `output_values`; fallback a contenido.
-        """
-        try:
-            node_type = str(getattr(node, 'node_type', 'generic') or 'generic').lower()
-            if node_type == 'output':
-                if prefer_input_for_output:
-                    # Mostrar lo que llega al Output
-                    iv = getattr(node, 'input_values', {}) or {}
-                    if iv:
-                        # Puerto por defecto 'input' o primero
-                        val = iv.get('input', None)
-                        if val is None and len(iv) > 0:
-                            try:
-                                key = next(iter(iv.keys()))
-                                val = iv.get(key, None)
-                            except Exception:
-                                val = None
-                        if isinstance(val, (str, bytes)):
-                            return val if isinstance(val, str) else val.decode('utf-8', 'ignore')
-                        if val is not None:
-                            return str(val)
-                # Si no se prefiere input o no hay, mostrar salida si reenvía
-                try:
-                    if getattr(node, 'forward_output', False):
-                        ov = getattr(node, 'output_values', {}) or {}
-                        if ov:
-                            val = ov.get('output', None)
-                            if val is None and len(ov) > 0:
-                                key = next(iter(ov.keys()))
-                                val = ov.get(key, None)
-                            return str(val) if val is not None else ''
-                except Exception:
-                    pass
-                # Fallback
-                try:
-                    return node.to_plain_text()
-                except Exception:
-                    return getattr(node, 'content', '') or ''
-
-            # No-Output: tomar salida evaluada
-            ov = getattr(node, 'output_values', {}) or {}
-            if ov:
-                val = ov.get('output', None)
-                if val is None and len(ov) > 0:
-                    try:
-                        key = next(iter(ov.keys()))
-                        val = ov.get(key, None)
-                    except Exception:
-                        val = None
-                if isinstance(val, (str, bytes)):
-                    return val if isinstance(val, str) else val.decode('utf-8', 'ignore')
-                if val is not None:
-                    return str(val)
-            # Fallback a contenido
-            try:
-                return node.to_plain_text()
-            except Exception:
-                return getattr(node, 'content', '') or ''
-        except Exception:
-            return ''
-
-    def _save_combined_as_node(self):
-        """Crea un nodo Output con el texto combinado mostrado en pestaña Outputs."""
-        try:
-            target = getattr(self, 'preview_outputs', None)
-            combined = target.toPlainText() if target else ""
-            if not combined:
-                QMessageBox.information(self, "Sin contenido", "No hay texto combinado para guardar.")
-                return
-            center = self.node_view.mapToScene(self.node_view.viewport().rect().center())
-            node = self.node_view.add_node(title="Output Combined", x=center.x(), y=center.y(), node_type="output", content=combined)
-            try:
-                # Marcar como snapshot para que el runtime no lo sobrescriba
-                setattr(node, 'is_snapshot', True)
-                if hasattr(node, '_refresh_title_text'):
-                    node._refresh_title_text()
-            except Exception:
-                pass
-            node.setSelected(True)
-            self.node_view.centerOn(node)
-            # Actualizar visor
-            self._update_outputs_tab()
-            try:
-                # Forzar reevaluación para sincronizar vistas
-                self.node_view.evaluate_graph()
-            except Exception:
-                pass
-        except Exception as e:
-            logger.exception("No se pudo guardar combinado como nodo: %s", e)
-            QMessageBox.warning(self, "Error", f"No se pudo crear el nodo combinado: {e}")
-
-    # ------------------------------
-    # Editar nodo
-    # ------------------------------
-    def start_edit_node(self, node):
-        if node is None:
-            return
-        self._current_node = node
-        # Bloquear modo edición para nodos Output: su contenido es controlado por runtime/snapshot
-        node_type = str(getattr(node, 'node_type', '')).lower()
-        is_output = (node_type == 'output')
-        self._editing_mode = not is_output
-
-        # seleccionar nodo en la escena
-        if hasattr(self.node_view, "_scene"):
-            for it in self.node_view._scene.selectedItems():
-                it.setSelected(False)
-            node.setSelected(True)
-
-        # actualizar editor
-        self._updating_text = True
-        try:
-            self.text_editor.setPlainText(node.to_plain_text())
-        except Exception:
-            self.text_editor.setPlainText(getattr(node, "content", ""))
-        # Si es Output, mantener lectura; si no, permitir edición
-        self.text_editor.setReadOnly(is_output)
-        self.text_editor.setEnabled(True)
-        self._updating_text = False
-
-        # Sólo marcar edición y conectar señales si no es Output
-        if not is_output:
-            try:
-                node.set_editing(True)
-            except Exception:
-                pass
-            # Conectar señales del editor incrustado del nodo para sincronizar con el lateral
-            self._connect_inline_editor_signals(node)
-
-            self.text_editor.setFocus()
-            # Actualizar acción
-            if hasattr(self, "_edit_toggle_action"):
-                self._edit_toggle_action.setText("Salir de edición")
-        else:
-            # Para Output, reflejar en acción que no se edita
-            if hasattr(self, "_edit_toggle_action"):
-                self._edit_toggle_action.setText("Editar nodo")
-
-    def on_text_changed(self):
-        """Cuando el texto del editor cambia, actualiza el nodo seleccionado."""
-        if self._updating_text:
-            return
-        if self.current_node and hasattr(self.current_node, 'update_from_text'):
-            try:
-                text = self.text_editor.toPlainText()
-                self.current_node.update_from_text(text)
-                # Si el nodo está en modo edición y tiene editor incrustado, sincronizarlo
-                try:
-                    if getattr(self.current_node, '_editing', False) and hasattr(self.current_node, 'content_editor'):
-                        editor = self.current_node.content_editor
-                        if editor.toPlainText() != text:
-                            prev = editor.blockSignals(True)
-                            editor.setPlainText(text)
-                            editor.blockSignals(prev)
-                except Exception:
-                    pass
-                # Reevaluar grafo usando debounce para refrescar Outputs en tiempo real
-                try:
-                    self._schedule_evaluate_graph()
-                except Exception:
-                    pass
-            except Exception:
-                pass
-        # No auto-cerrar edición: el usuario decide salir con el botón o al cambiar de nodo
-
-    def _clear_node_editing_state(self):
-        if self._current_node and hasattr(self._current_node, "set_editing"):
-            try:
-                self._current_node.set_editing(False)
-            except Exception:
-                pass
-        self._disconnect_inline_editor_signals()
-        if hasattr(self, "_edit_toggle_action"):
-            self._edit_toggle_action.setText("Editar nodo")
-
-    # ------------------------------
-    # Guardar nodo
-    # ------------------------------
-    def save_node_from_editor(self):
-        if not self._current_node or not self._editing_mode:
-            return
-        text = self.text_editor.toPlainText()
-        try:
-            self._current_node.update_from_text(text)
-        except Exception as e:
-            logger.exception("Error guardando nodo: %s", e)
-
-        self._editing_mode = False
-        self._clear_node_editing_state()
-        self._update_text_editor_preview()
-        if hasattr(self, "_edit_toggle_action"):
-            self._edit_toggle_action.setText("Editar nodo")
-
-    def _on_node_edit_exited(self, node):
-        """Salida de edición solicitada desde el propio nodo (botón incrustado)."""
-        try:
-            # Asegurar referencia al nodo actual
-            self._current_node = node
-            self.current_node = node
-            # Guardar cambios mínimos desde el editor lateral si estaba en modo edición
-            # No hacer commit para nodos Output
-            node_type = str(getattr(node, 'node_type', '')).lower()
-            if node_type != 'output':
-                text = self.text_editor.toPlainText()
-                try:
-                    node.update_from_text(text)
-                except Exception:
-                    pass
-            # Salir de edición y actualizar interfaz
-            self._editing_mode = False
-            self._clear_node_editing_state()
-            self._update_text_editor_preview()
-            if hasattr(self, "_edit_toggle_action"):
-                self._edit_toggle_action.setText("Editar nodo")
-            # Reevaluar grafo tras salir de edición (debounced)
-            try:
-                self._schedule_evaluate_graph()
-            except Exception:
-                pass
-        except Exception:
-            pass
-
-    # ------------------------------
-    # Sincronización con editor incrustado en nodo
-    # ------------------------------
-    def _connect_inline_editor_signals(self, node):
-        try:
-            if hasattr(node, 'content_editor'):
-                node.content_editor.textChanged.connect(self.on_node_inline_text_changed)
-                self._inline_editor_node = node
-        except Exception:
-            pass
-
-    def _disconnect_inline_editor_signals(self):
-        try:
-            node = getattr(self, '_inline_editor_node', None)
-            if node and hasattr(node, 'content_editor'):
-                node.content_editor.textChanged.disconnect(self.on_node_inline_text_changed)
-        except Exception:
-            pass
-
-    # ------------------------------
-    # Filtro global de eventos (capturar TAB)
-    # ------------------------------
-    def eventFilter(self, obj, event):
-        try:
-            if event.type() == QEvent.KeyPress and event.key() == Qt.Key_Tab:
-                # Capturar TAB globalmente y abrir el menú de creación en NodeView
-                try:
-                    if hasattr(self, 'node_view') and self.node_view:
-                        self.node_view._show_tab_menu()
-                        return True
-                except Exception:
-                    pass
-                # Si falla, no bloquear el evento
-                return False
-        except Exception:
-            pass
-        return super().eventFilter(obj, event)
-        self._inline_editor_node = None
-
-    def on_node_inline_text_changed(self):
-        node = getattr(self, '_inline_editor_node', None)
-        if node is None:
-            return
-        try:
-            text = node.content_editor.toPlainText()
-        except Exception:
-            text = getattr(node, 'content', '')
-        # Actualizar editor lateral sin recursión
-        self._updating_text = True
-        try:
-            self.text_editor.setPlainText(text)
-        finally:
-            self._updating_text = False
-        # Actualizar modelo del nodo
-        try:
-            if hasattr(node, 'update_from_text'):
-                node.update_from_text(text)
-            else:
-                node.content = text
-            # Reevaluar grafo (debounced) para reflejar cambios desde el editor incrustado
-            try:
-                self._schedule_evaluate_graph()
-            except Exception:
-                pass
-        except Exception:
-            pass
-
-    # ------------------------------
-    # Guardar/Cargar proyecto
-    # ------------------------------
-    def _collect_models_from_scene(self):
-        """Recopila los modelos de todos los nodos y conexiones en la escena."""
-        models = []
-        connections = []
-        try:
-            from ..graph.node_item import NodeItem
-            from ..graph.node_model import NodeModel
-            if not hasattr(self.node_view, "_scene"):
-                return models, connections
-                
-            # Recopilar nodos
-            for item in self.node_view._scene.items():
-                if isinstance(item, NodeItem):
-                    pos = item.scenePos()
-                    # Combinar meta semántica con flags de editor
-                    base_meta = {}
-                    try:
-                        if isinstance(getattr(item, "semantic_meta", None), dict):
-                            base_meta = dict(getattr(item, "semantic_meta", {}) or {})
-                    except Exception:
-                        base_meta = {}
-                    try:
-                        base_meta["is_snapshot"] = bool(getattr(item, "is_snapshot", False))
-                        base_meta["forward_output"] = bool(getattr(item, "forward_output", False))
-                    except Exception:
-                        pass
-                    nm = NodeModel(
-                        id=getattr(item, "id", str(id(item))),
-                        type=getattr(item, "node_type", "generic"),
-                        title=getattr(item, "title", ""),
-                        x=pos.x(),
-                        y=pos.y(),
-                        content=getattr(item, "content", ""),
-                        meta=base_meta
+                scene = getattr(self.node_view, '_scene', None)
+                selected_nodes = [it for it in (scene.selectedItems() if scene else []) if isinstance(it, NodeItem)]
+                if len(selected_nodes) == 1:
+                    src = selected_nodes[0]
+                    # Posicionar el monitor a la derecha del nodo seleccionado
+                    pos = src.scenePos()
+                    mon_x = float(pos.x() + 140.0)
+                    mon_y = float(pos.y())
+                    mon = self.node_view.add_node_with_ports(
+                        title="Monitor",
+                        x=mon_x,
+                        y=mon_y,
+                        node_type="output",
+                        inputs=[{"name": "input", "kind": "data", "multi": True}],
+                        outputs=["output"],
+                        content=""
                     )
-                    models.append(nm)
-            
-            # Recopilar conexiones
-            for connection in getattr(self.node_view, 'connections', []):
-                conn_data = {
-                    'start_node_id': str(id(connection.start_item)),
-                    'end_node_id': str(id(connection.end_item)) if connection.end_item else None,
-                    'start_port': connection.start_port,
-                    'end_port': connection.end_port
-                }
-                connections.append(conn_data)
-                    
-        except Exception:
-            logger.exception("Error recolectando modelos desde escena")
-        return models, connections
-
-    def save_project(self):
-        """Guarda el proyecto actual con nodos y conexiones."""
-        path, _ = QFileDialog.getSaveFileName(self, "Guardar proyecto", "", "JSON Files (*.json)")
-        if not path:
-            return
-        try:
-            import json
-            models, connections = self._collect_models_from_scene()
-            # Serializar nodos
-            try:
-                from ..graph.node_model import NodeModel
-                nodes_serialized = [m.to_dict() if isinstance(m, NodeModel) else m for m in models]
-            except Exception:
-                nodes_serialized = [getattr(m, 'to_dict', lambda: {})() for m in models]
-
-            # Vista y UI
-            try:
-                t = self.node_view.transform()
-                view_center = self.node_view.mapToScene(self.node_view.viewport().rect().center())
-                view_state = {
-                    'transform': {
-                        'm11': t.m11(), 'm12': t.m12(), 'm13': t.m13(),
-                        'm21': t.m21(), 'm22': t.m22(), 'm23': t.m23(),
-                        'm31': t.m31(), 'm32': t.m32(), 'm33': t.m33(),
-                    },
-                    'center': {'x': float(view_center.x()), 'y': float(view_center.y())}
-                }
-            except Exception:
-                view_state = {}
-
-            try:
-                ui_state = {
-                    'outer_splitter': self.outer_splitter.sizes(),
-                    'inner_splitter': getattr(self, 'inner_splitter', self.outer_splitter).sizes()
-                }
-            except Exception:
-                ui_state = {}
-
-            project_data = {
-                'metadata': {
-                    'name': getattr(self, 'current_project_name', 'Proyecto'),
-                    'version': '1.0'
-                },
-                'nodes': nodes_serialized,
-                'connections': connections,
-                'view': view_state,
-                'ui': ui_state,
-            }
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(project_data, f, indent=2, ensure_ascii=False)
-            QMessageBox.information(self, "Éxito", f"Proyecto guardado en {path}")
-            self.statusBar().showMessage(f'Proyecto guardado: {path}', 2000)
-            self.setWindowModified(False)
-        except Exception as e:
-            logger.exception("Error guardando proyecto: %s", e)
-            QMessageBox.critical(self, "Error", f"No se pudo guardar: {e}")
-            return False
-
-    def load_project(self):
-        """Carga un proyecto desde archivo JSON."""
-        path, _ = QFileDialog.getOpenFileName(self, "Cargar proyecto", "", "JSON Files (*.json)")
-        if not path:
-            return
-        try:
-            import json
-            from ..graph.node_model import project_from_dict
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            nodes = project_from_dict(data)
-            if hasattr(self.node_view, "clear_nodes"):
-                self.node_view.clear_nodes()
-                node_map = {}
-                for n in nodes:
-                    node = self.node_view.add_node(n.title, n.x, n.y, node_type=n.type, content=n.content)
-                    # Restaurar flags/meta
-                    try:
-                        if isinstance(getattr(n, 'meta', None), dict):
-                            setattr(node, 'semantic_meta', dict(n.meta or {}))
-                            # Flags del editor
-                            setattr(node, 'is_snapshot', bool((n.meta or {}).get('is_snapshot', False)))
-                            setattr(node, 'forward_output', bool((n.meta or {}).get('forward_output', False)))
-                            if hasattr(node, '_refresh_title_text'):
-                                node._refresh_title_text()
-                    except Exception:
-                        pass
-                    node_map[n.id] = node
-                # Restaurar conexiones
-                for conn_data in data.get('connections', []):
-                    start_id = conn_data.get('start_node_id')
-                    end_id = conn_data.get('end_node_id')
-                    start_port = conn_data.get('start_port', 'output')
-                    end_port = conn_data.get('end_port', 'input')
-                    if start_id in node_map and end_id in node_map:
-                        start_node = node_map[start_id]
-                        end_node = node_map[end_id]
-                        self.node_view.add_connection(start_node, end_node, start_port, end_port)
-                # Restaurar estado de vista
-                try:
-                    from PySide6.QtGui import QTransform
-                    view_data = data.get('view', {})
-                    tf = view_data.get('transform')
-                    if tf:
-                        t = QTransform(
-                            float(tf.get('m11', 1)), float(tf.get('m12', 0)), float(tf.get('m13', 0)),
-                            float(tf.get('m21', 0)), float(tf.get('m22', 1)), float(tf.get('m23', 0)),
-                            float(tf.get('m31', 0)), float(tf.get('m32', 0)), float(tf.get('m33', 1))
-                        )
-                        self.node_view.setTransform(t)
-                    center = view_data.get('center')
-                    if center:
-                        self.node_view.centerOn(float(center.get('x', 0)), float(center.get('y', 0)))
-                except Exception:
-                    pass
-                # Restaurar UI (tamaños de splitters)
-                try:
-                    ui_data = data.get('ui', {})
-                    outer_sizes = ui_data.get('outer_splitter')
-                    inner_sizes = ui_data.get('inner_splitter')
-                    if outer_sizes:
-                        self.outer_splitter.setSizes(outer_sizes)
-                    if inner_sizes and hasattr(self, 'inner_splitter'):
-                        self.inner_splitter.setSizes(inner_sizes)
-                except Exception:
-                    pass
-            QMessageBox.information(self, "Éxito", f"Proyecto cargado desde {path}")
-        except Exception as e:
-            logger.exception("Error cargando proyecto: %s", e)
-            QMessageBox.critical(self, "Error", f"No se pudo cargar: {e}")
-
-    def toggle_edit_mode(self):
-        """Alterna entre selección (vista previa) y edición del nodo actual."""
-        node = self._current_node or getattr(self, 'current_node', None)
-        if node is None:
-            return
-        if not self._editing_mode:
-            # Entrar en edición usando flujo existente
-            self.start_edit_node(node)
-            # Centrar y elevar en la vista
-            try:
-                self.node_view.centerOn(node)
+                    if mon is not None:
+                        try:
+                            setattr(mon, 'forward_output', True)
+                        except Exception:
+                            pass
+                        # Autoconectar primer OUT del seleccionado al IN del monitor
+                        try:
+                            start_port = (src.output_ports[0]['name'] if getattr(src, 'output_ports', None) else 'output')
+                            end_port = (mon.input_ports[0]['name'] if getattr(mon, 'input_ports', None) else 'input')
+                            self.node_view.add_connection(src, mon, start_port=start_port, end_port=end_port)
+                        except Exception:
+                            pass
+                        # Intentar seleccionar y centrar
+                        try:
+                            mon.setSelected(True)
+                            self.node_view.centerOn(mon)
+                        except Exception:
+                            pass
+                        # Enfocar pestaña del monitor en el Preview si existe
+                        try:
+                            win.refresh_tabs()
+                            # Buscar editor asociado al monitor
+                            ed = getattr(win, '_editors', {}).get(mon)
+                            if ed is not None:
+                                for i in range(win.tabs.count()):
+                                    if win.tabs.widget(i) is ed:
+                                        win.tabs.setCurrentIndex(i)
+                                        break
+                        except Exception:
+                            pass
             except Exception:
                 pass
-        else:
-            # Salir de edición guardando
-            self.save_node_from_editor()
+            # Forzar evaluación del grafo para que el Preview tenga datos al abrir
+            try:
+                self.node_view.evaluate_graph()
+            except Exception:
+                pass
+            # Refrescar contenidos por si hay buffers iniciales
+            try:
+                win.refresh_tabs()
+                win.refresh_contents()
+            except Exception:
+                pass
+            win.show()
+            win.raise_()
+            win.activateWindow()
+        except Exception:
+            pass
+
+
+__all__ = ["EditorWindow"]
