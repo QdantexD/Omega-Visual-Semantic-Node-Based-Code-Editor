@@ -1,11 +1,11 @@
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QToolBar, QFileDialog, QMessageBox, QSplitter, QStatusBar, QLabel, QTextEdit, QTabWidget, QPushButton, QCheckBox
+    QToolBar, QFileDialog, QMessageBox, QSplitter, QStatusBar, QLabel, QTextEdit, QTabWidget, QPushButton, QCheckBox, QToolButton, QButtonGroup, QMenu
 )
 from PySide6.QtCore import QTimer
 from ..graph.node_item import NodeItem
-from PySide6.QtGui import QAction  # ✅ Correcto
-from PySide6.QtCore import Qt, QTimer, QEvent
+from PySide6.QtGui import QAction, QShortcut, QKeySequence  # ✅ Correcto
+from PySide6.QtCore import Qt, QTimer, QEvent, QSize, QDir
 import importlib
 import logging
 
@@ -178,10 +178,243 @@ class EditorWindow(QMainWindow):
             self.outer_splitter.setSizes([self._sidebar_last_size, 900])
         except Exception:
             pass
-        vbox = QVBoxLayout(central)
-        vbox.setContentsMargins(0, 0, 0, 0)
-        vbox.addWidget(self.outer_splitter)
+        # --- Barra de íconos global fija al borde izquierdo ---
+        try:
+            # Ocultar barra interna del Explorer si existe
+            if self.file_explorer and hasattr(self.file_explorer, 'set_external_rail'):
+                self.file_explorer.set_external_rail(True)
+        except Exception:
+            pass
+
+        from PySide6.QtWidgets import QFrame
+        global_bar_width = 48
+        try:
+            global_bar_width = getattr(self.file_explorer, '_rail_width', 48) or 48
+        except Exception:
+            global_bar_width = 48
+
+        self._activity_bar = QFrame()
+        self._activity_bar.setObjectName("GlobalActivityBar")
+        try:
+            self._activity_bar.setFixedWidth(int(global_bar_width))
+        except Exception:
+            pass
+        # QToolButton ya importado a nivel de módulo
+        from PySide6.QtGui import QIcon
+        bar_layout = QVBoxLayout(self._activity_bar)
+        bar_layout.setContentsMargins(6, 8, 6, 8)
+        bar_layout.setSpacing(10)
+
+        def mk_btn(icon_name: str, tooltip: str) -> QToolButton:
+            btn = QToolButton()
+            try:
+                icon = QIcon.fromTheme(icon_name)
+                if not icon.isNull():
+                    btn.setIcon(icon)
+                else:
+                    # Fallback minimalista si no hay icono del sistema
+                    fallback = {
+                        "folder": "📁",
+                        "system-search": "🔍",
+                        "preferences-system": "⚙",
+                        "view-visible": "👁",
+                        "bug": "🐞",
+                        "wallet": "💼",
+                        "view-grid": "⬛",
+                        "applications-science": "🧪",
+                        "server": "🖥",
+                        "database": "🗄",
+                    }.get(icon_name, "·")
+                    btn.setText(fallback)
+            except Exception:
+                pass
+            btn.setToolTip(tooltip)
+            btn.setIconSize(QSize(20, 20))
+            btn.setAutoRaise(True)
+            btn.setCheckable(True)
+            btn.setCursor(Qt.PointingHandCursor)
+            return btn
+
+        # Botones estilo VS Code
+        self._bar_btn_files = mk_btn("folder", "Archivos")
+        self._bar_btn_search = mk_btn("system-search", "Buscar")
+        self._bar_btn_graph = mk_btn("preferences-system", "Grafo")
+        self._bar_btn_eye = mk_btn("view-visible", "Vista")
+        self._bar_btn_bug = mk_btn("bug", "Depurar")
+        self._bar_btn_wallet = mk_btn("wallet", "Finanzas")
+        self._bar_btn_grid = mk_btn("view-grid", "Cuadrícula")
+        self._bar_btn_lab = mk_btn("applications-science", "Laboratorio")
+        self._bar_btn_server = mk_btn("server", "Servidor")
+        self._bar_btn_db = mk_btn("database", "Datos")
+
+        for btn in (
+            self._bar_btn_files,
+            self._bar_btn_search,
+            self._bar_btn_graph,
+            self._bar_btn_eye,
+            self._bar_btn_bug,
+            self._bar_btn_wallet,
+            self._bar_btn_grid,
+            self._bar_btn_lab,
+            self._bar_btn_server,
+            self._bar_btn_db,
+        ):
+            bar_layout.addWidget(btn)
+        bar_layout.addStretch(1)
+
+        # Grupo exclusivo para resaltar un único botón activo
+        try:
+            self._activity_group = QButtonGroup(self)
+            self._activity_group.setExclusive(True)
+            for btn in (
+                self._bar_btn_files,
+                self._bar_btn_search,
+                self._bar_btn_graph,
+                self._bar_btn_eye,
+                self._bar_btn_bug,
+                self._bar_btn_wallet,
+                self._bar_btn_grid,
+                self._bar_btn_lab,
+                self._bar_btn_server,
+                self._bar_btn_db,
+            ):
+                self._activity_group.addButton(btn)
+        except Exception:
+            pass
+
+        # Comportamiento: Files alterna mostrar/ocultar Explorer
+        try:
+            self._bar_btn_files.clicked.connect(self._toggle_sidebar)
+        except Exception:
+            pass
+        try:
+            def _focus_search():
+                try:
+                    self._apply_sidebar(False)
+                    if self.file_explorer and hasattr(self.file_explorer, 'search_bar'):
+                        self.file_explorer.search_bar.setFocus()
+                except Exception:
+                    pass
+            self._bar_btn_search.clicked.connect(_focus_search)
+        except Exception:
+            pass
+
+        # Menú contextual de carpeta: seleccionar raíz del Explorer
+        try:
+            self._bar_btn_files.setContextMenuPolicy(Qt.CustomContextMenu)
+            def _open_files_menu(pos):
+                try:
+                    menu = QMenu(self)
+                    act_open = menu.addAction("Abrir carpeta…")
+                    act_proj = menu.addAction("Proyecto actual")
+                    act_docs = menu.addAction("Documentos")
+                    act_desktop = menu.addAction("Escritorio")
+                    chosen = menu.exec(self._bar_btn_files.mapToGlobal(pos))
+                    import os
+                    from PySide6.QtCore import QDir
+                    if chosen == act_open:
+                        path = QFileDialog.getExistingDirectory(self, "Elegir carpeta", QDir.homePath())
+                        if path:
+                            if self.file_explorer and hasattr(self.file_explorer, 'set_root'):
+                                self.file_explorer.set_root(path)
+                                self._apply_sidebar(False)
+                    elif chosen == act_proj:
+                        path = QDir.currentPath()
+                        if self.file_explorer and hasattr(self.file_explorer, 'set_root'):
+                            self.file_explorer.set_root(path)
+                            self._apply_sidebar(False)
+                    elif chosen == act_docs:
+                        home = QDir.homePath()
+                        path = os.path.join(home, 'Documents')
+                        if self.file_explorer and hasattr(self.file_explorer, 'set_root'):
+                            self.file_explorer.set_root(path)
+                            self._apply_sidebar(False)
+                    elif chosen == act_desktop:
+                        home = QDir.homePath()
+                        path = os.path.join(home, 'Desktop')
+                        if self.file_explorer and hasattr(self.file_explorer, 'set_root'):
+                            self.file_explorer.set_root(path)
+                            self._apply_sidebar(False)
+                except Exception:
+                    pass
+            self._bar_btn_files.customContextMenuRequested.connect(_open_files_menu)
+        except Exception:
+            pass
+
+        # Estilo del activity bar global
+        try:
+            self._activity_bar.setStyleSheet(
+                """
+                QWidget#GlobalActivityBar { background: #1b1f27; border-right: 1px solid #2a2f39; }
+                QToolButton { color: #cbd5e1; padding: 6px; }
+                QToolButton:hover { background: #222733; border-radius: 6px; }
+                QToolButton:checked { background: #2a3140; border-radius: 6px; }
+                """
+            )
+        except Exception:
+            pass
+
+        # Layout central con barra global + splitter principal
+        hbox = QHBoxLayout(central)
+        hbox.setContentsMargins(0, 0, 0, 0)
+        hbox.setSpacing(0)
+        hbox.addWidget(self._activity_bar)
+        hbox.addWidget(self.outer_splitter)
         self.setCentralWidget(central)
+
+        # Estado inicial: Explorer visible → botón Files activo
+        try:
+            self._bar_btn_files.setChecked(True)
+        except Exception:
+            pass
+
+        # Atajo global: Ctrl+O para seleccionar carpeta del Explorer
+        try:
+            self._shortcut_open_folder = QShortcut(QKeySequence("Ctrl+O"), self)
+            self._shortcut_open_folder.setAutoRepeat(False)
+            def _open_folder_shortcut():
+                try:
+                    start_dir = QDir.currentPath()
+                except Exception:
+                    import os
+                    start_dir = os.getcwd()
+                try:
+                    path = QFileDialog.getExistingDirectory(self, "Seleccionar carpeta", start_dir)
+                    if path and self.file_explorer and hasattr(self.file_explorer, 'set_root'):
+                        self.file_explorer.set_root(path)
+                        # Mostrar Explorer si estaba oculto
+                        self._apply_sidebar(False)
+                        # Resaltar botón Files
+                        try:
+                            self._set_activity_active("files")
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+            self._shortcut_open_folder.activated.connect(_open_folder_shortcut)
+        except Exception:
+            pass
+
+    def _set_activity_active(self, name: str):
+        """Marca el botón de la barra global como activo por nombre lógico."""
+        try:
+            mapping = {
+                "files": self._bar_btn_files,
+                "search": self._bar_btn_search,
+                "graph": self._bar_btn_graph,
+                "eye": self._bar_btn_eye,
+                "bug": self._bar_btn_bug,
+                "wallet": self._bar_btn_wallet,
+                "grid": self._bar_btn_grid,
+                "lab": self._bar_btn_lab,
+                "server": self._bar_btn_server,
+                "db": self._bar_btn_db,
+            }
+            for key, btn in mapping.items():
+                if btn:
+                    btn.setChecked(key == name)
+        except Exception:
+            pass
 
         # --- Toolbar ---
         self._setup_toolbar()
@@ -206,26 +439,41 @@ class EditorWindow(QMainWindow):
     # ------------------------------
     def _toggle_sidebar(self):
         try:
+            self._apply_sidebar(not self._sidebar_collapsed)
+        except Exception:
+            pass
+
+    def _apply_sidebar(self, compact: bool):
+        try:
             sizes = self.outer_splitter.sizes()
             total = sum(sizes) if sizes else 1140
-            if not self._sidebar_collapsed:
-                # Colapsar: guardar tamaño actual y ocultar
+            if compact:
+                # Guardar último tamaño antes de compactar
                 self._sidebar_last_size = max(180, sizes[0]) if sizes else self._sidebar_last_size
-                if self.file_explorer:
-                    self.file_explorer.setVisible(False)
-                self.outer_splitter.setSizes([0, total])
+                if self.file_explorer and hasattr(self.file_explorer, 'set_compact'):
+                    self.file_explorer.set_compact(True)
+                # Con barra externa fija, el panel del Explorer colapsa a 0px
+                left = 0
+                self.outer_splitter.setSizes([left, max(200, total - left)])
                 self._sidebar_collapsed = True
-                if hasattr(self, "_sidebar_toggle_action"):
-                    self._sidebar_toggle_action.setText("Mostrar Explorer")
+                # Toolbar no controla el texto de toggle; se usa la barra lateral
+                # Desactivar resaltado de Files cuando está colapsado
+                try:
+                    self._set_activity_active("")
+                except Exception:
+                    pass
             else:
-                # Expandir: restaurar tamaño
-                if self.file_explorer:
-                    self.file_explorer.setVisible(True)
+                if self.file_explorer and hasattr(self.file_explorer, 'set_compact'):
+                    self.file_explorer.set_compact(False)
                 left = min(self._sidebar_last_size, total - 200)
                 self.outer_splitter.setSizes([left, max(200, total - left)])
                 self._sidebar_collapsed = False
-                if hasattr(self, "_sidebar_toggle_action"):
-                    self._sidebar_toggle_action.setText("Ocultar Explorer")
+                # Toolbar no controla el texto de toggle; se usa la barra lateral
+                # Activar resaltado de Files cuando está visible
+                try:
+                    self._set_activity_active("files")
+                except Exception:
+                    pass
         except Exception:
             pass
 
@@ -296,8 +544,16 @@ class EditorWindow(QMainWindow):
     # Toolbar
     # ------------------------------
     def _setup_toolbar(self):
+        # Evitar duplicar la barra si ya existe
+        existing = getattr(self, "_main_toolbar", None)
+        if existing:
+            try:
+                self.removeToolBar(existing)
+            except Exception:
+                pass
         toolbar = QToolBar("Main")
         self.addToolBar(toolbar)
+        self._main_toolbar = toolbar
 
         edit_toggle = QAction("Editar nodo", self)
         edit_toggle.setShortcut("Ctrl+E")
@@ -324,12 +580,7 @@ class EditorWindow(QMainWindow):
         expand_conn.triggered.connect(self._expand_last_connection_editor)
         toolbar.addAction(expand_conn)
 
-        # Toggle Explorer minimalista (como VS Code: Ctrl+B)
-        sidebar_toggle = QAction("Ocultar Explorer", self)
-        sidebar_toggle.setShortcut("Ctrl+B")
-        sidebar_toggle.triggered.connect(self._toggle_sidebar)
-        toolbar.addAction(sidebar_toggle)
-        self._sidebar_toggle_action = sidebar_toggle
+        # El toggle del Explorer se controla desde la barra de actividad izquierda
 
         # Toggle Minimapa
         minimap_toggle = QAction("Minimapa", self)
