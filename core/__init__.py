@@ -18,7 +18,6 @@ from .graph.connection_logic import PassthroughLogic, ListAccumLogic
 
 # --- App (ventanas principales) ---
 from .app.editor_window import EditorWindow
-from .app.output_preview_window import OutputPreviewWindow
 from .app.node_view_adapter import MyNodeGraphController
 
 # --- UI (widgets auxiliares) ---
@@ -37,7 +36,6 @@ __all__ = [
     "ListAccumLogic",
     # App
     "EditorWindow",
-    "OutputPreviewWindow",
     "MyNodeGraphController",
     # UI
     "FileExplorer",

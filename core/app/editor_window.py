@@ -4,10 +4,12 @@ from typing import Optional
 
 from PySide6 import QtCore, QtGui, QtWidgets
 from ..ui.app_icons import make_hat_icon, make_hat_icon_neon, make_top_hat_icon
+from ..ui.text_editor import TextEditor
+from .code_editor_window import CodeEditorWindow
 from ..graph.node_item import NodeItem
 from .blueprint_editor_window import BlueprintEditorWindow
 from .node_content_editor_window import NodeContentEditorWindow
-from .output_preview_window import OutputPreviewWindow
+from .realtime_variables_panel import RealtimeVariablesPanel
 
 # Carga robusta de FileExplorer con rutas absoluta y relativa
 def _import_file_explorer():
@@ -107,23 +109,121 @@ class EditorWindow(QtWidgets.QMainWindow):
         self.work_tabs = QtWidgets.QTabWidget(self)
         self.work_tabs.setDocumentMode(True)
         self.work_tabs.setTabPosition(QtWidgets.QTabWidget.North)
+        # Habilitar cierre y movimiento de pestañas, y botón '+' en la esquina
+        try:
+            self.work_tabs.setTabsClosable(True)
+            self.work_tabs.setMovable(True)
+            self.work_tabs.tabCloseRequested.connect(self._on_tab_close_requested)
+            # Menú de opciones para la pestaña especial '+'
+            add_menu = QtWidgets.QMenu(self)
+            act_repeat_nodes = QtGui.QAction("Repetir Nodos (clonar grafo)", self)
+            act_code = QtGui.QAction("Editor de código / texto", self)
+            add_menu.addAction(act_repeat_nodes)
+            add_menu.addAction(act_code)
+            act_repeat_nodes.triggered.connect(self._open_nodes_editor_window_clone)
+            act_code.triggered.connect(self._open_code_editor_window)
+            # Guardar la referencia para que _on_tab_changed pueda mostrarlo
+            self._add_tab_menu = add_menu
+        except Exception:
+            pass
+        self._text_tab_counter = 0
+        # Mantener referencias a ventanas hijas para evitar GC prematuro
+        self._child_windows: list[QtWidgets.QWidget] = []
         self.outer_splitter.addWidget(self.work_tabs)
 
-        # NodeView o placeholder dentro de un contenedor con barra inferior propia
+        # NodeView + panel lateral dentro de un splitter, con barra inferior propia
         self.node_view = _load_node_view(self)
         self.node_tab = QtWidgets.QWidget(self)
         node_tab_layout = QtWidgets.QVBoxLayout(self.node_tab)
         node_tab_layout.setContentsMargins(0, 0, 0, 0)
         node_tab_layout.setSpacing(0)
-        node_tab_layout.addWidget(self.node_view, 1)
+
+        # Splitter horizontal: NodeView (izquierda) | RealtimeVariablesPanel (derecha)
+        self._work_splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal, self.node_tab)
+        self._work_splitter.setChildrenCollapsible(False)
+        self._work_splitter.addWidget(self.node_view)
+        try:
+            self.live_panel = RealtimeVariablesPanel(self.node_view, parent=self.node_tab)
+        except Exception:
+            self.live_panel = QtWidgets.QLabel("Panel en tiempo real no disponible", self.node_tab)
+            self.live_panel.setAlignment(QtCore.Qt.AlignCenter)
+            self.live_panel.setStyleSheet("color:#cbd5e1;background:#0f1318;")
+        self._work_splitter.addWidget(self.live_panel)
+        # Tamaños iniciales: dar espacio al panel sin estorbar la edición
+        try:
+            self._work_splitter.setSizes([self.width() - 300, 300])
+        except Exception:
+            pass
+        node_tab_layout.addWidget(self._work_splitter, 1)
+
         # Construir barra inferior específica del editor de nodos
         self._node_bar_container = self._build_node_bottom_bar()
         node_tab_layout.addWidget(self._node_bar_container, 0)
         self.work_tabs.addTab(self.node_tab, "Nodos")
+        try:
+            # Ocultar botón de cierre en la pestaña fija 'Nodos'
+            tb = self.work_tabs.tabBar()
+            idx = self.work_tabs.indexOf(self.node_tab)
+            if tb is not None and idx >= 0:
+                tb.setTabButton(idx, QtWidgets.QTabBar.RightSide, None)
+        except Exception:
+            pass
+
+        # Añadir una pestaña especial "+" que abre el menú de editores en nueva ventana
+        try:
+            self._add_tab_placeholder = QtWidgets.QWidget(self)
+            self._add_tab_index = self.work_tabs.addTab(self._add_tab_placeholder, "+")
+            tb = self.work_tabs.tabBar()
+            if tb is not None:
+                tb.setTabButton(self._add_tab_index, QtWidgets.QTabBar.RightSide, None)
+        except Exception:
+            self._add_tab_placeholder = None
+            self._add_tab_index = -1
 
         # Enfocar el panel de nodos al activar la pestaña para que TAB funcione
         try:
             self.work_tabs.currentChanged.connect(self._on_tab_changed)
+        except Exception:
+            pass
+
+        # Panel lateral deslizante para opciones del botón '+'
+        try:
+            self._add_side_panel = QtWidgets.QFrame(self)
+            self._add_side_panel.setObjectName("AddSidePanel")
+            self._add_side_panel.setFrameShape(QtWidgets.QFrame.NoFrame)
+            self._add_side_panel.setStyleSheet("background:#0f1318;border-left:1px solid #202a36;")
+            self._add_side_panel.setFixedWidth(280)
+            self._add_side_panel.hide()
+            sp_layout = QtWidgets.QVBoxLayout(self._add_side_panel)
+            sp_layout.setContentsMargins(12, 12, 12, 12)
+            sp_layout.setSpacing(10)
+            title = QtWidgets.QLabel("Crear nuevo…", self._add_side_panel)
+            title.setStyleSheet("color:#cbd5e1;font-weight:bold;font-size:14px;")
+            sp_layout.addWidget(title)
+            btn_clone = QtWidgets.QPushButton("Repetir Nodos (clonar grafo)", self._add_side_panel)
+            btn_clone.setStyleSheet("QPushButton{background:#1b2230;color:#cbd5e1;padding:8px;border:1px solid #202a36;border-radius:6px;}QPushButton:hover{background:#1a202a;}")
+            btn_code = QtWidgets.QPushButton("Editor de código / texto", self._add_side_panel)
+            btn_code.setStyleSheet("QPushButton{background:#1b2230;color:#cbd5e1;padding:8px;border:1px solid #202a36;border-radius:6px;}QPushButton:hover{background:#1a202a;}")
+            btn_dual = QtWidgets.QPushButton("Abrir ambos (nodos izquierda, texto derecha)", self._add_side_panel)
+            btn_dual.setStyleSheet("QPushButton{background:#1b2230;color:#cbd5e1;padding:8px;border:1px solid #202a36;border-radius:6px;}QPushButton:hover{background:#1a202a;}")
+            sp_layout.addWidget(btn_clone)
+            sp_layout.addWidget(btn_code)
+            sp_layout.addWidget(btn_dual)
+            sp_layout.addStretch(1)
+            btn_clone.clicked.connect(lambda: (self._open_nodes_editor_window_clone(), self._hide_add_panel()))
+            btn_code.clicked.connect(lambda: (self._open_code_editor_window(), self._hide_add_panel()))
+            btn_dual.clicked.connect(lambda: (self._open_dual_editors(), self._hide_add_panel()))
+
+            # Overlay para cerrar al click
+            self._panel_overlay = QtWidgets.QFrame(self)
+            self._panel_overlay.setStyleSheet("background:rgba(0,0,0,80);")
+            self._panel_overlay.hide()
+            def _ovr_mouse_press(ev):
+                try:
+                    self._hide_add_panel()
+                except Exception:
+                    pass
+            self._panel_overlay.mousePressEvent = _ovr_mouse_press  # type: ignore[assignment]
         except Exception:
             pass
 
@@ -326,7 +426,6 @@ class EditorWindow(QtWidgets.QMainWindow):
         self._btn_layout = _mk_btn("Auto layout")
         self._btn_delete = _mk_btn("Eliminar selección")
         self._btn_blueprint = _mk_btn("Editar en ventana…")
-        self._btn_output_preview = _mk_btn("Preview Outputs…")
 
         lay.addWidget(self._btn_add)
         lay.addWidget(self._btn_frame)
@@ -339,7 +438,7 @@ class EditorWindow(QtWidgets.QMainWindow):
         lay.addWidget(self._btn_layout)
         lay.addWidget(self._btn_delete)
         lay.addWidget(self._btn_blueprint)
-        lay.addWidget(self._btn_output_preview)
+        # Botón de Preview de Outputs eliminado
 
         return container
 
@@ -533,6 +632,21 @@ class EditorWindow(QtWidgets.QMainWindow):
     def _on_tab_changed(self, index: int) -> None:
         """Enfoca el NodeView cuando se activa la pestaña 'Nodos'."""
         try:
+            # Si el usuario pulsa la pestaña especial '+', mostrar el menú y volver
+            if hasattr(self, '_add_tab_index') and index == getattr(self, '_add_tab_index', -1):
+                try:
+                    # Mostrar panel lateral con animación
+                    self._show_add_panel()
+                except Exception:
+                    pass
+                # Volver a la pestaña de Nodos u a la anterior
+                try:
+                    node_index = self.work_tabs.indexOf(self.node_tab)
+                    if node_index >= 0:
+                        self.work_tabs.setCurrentIndex(node_index)
+                except Exception:
+                    pass
+                return
             widget = self.work_tabs.widget(index)
             if widget is self.node_tab:
                 # Dar foco para que keyPressEvent (TAB) sea capturado
@@ -545,6 +659,162 @@ class EditorWindow(QtWidgets.QMainWindow):
                     pass
                 # Actualizar estado visible
                 self._refresh_node_status_widgets()
+        except Exception:
+            pass
+
+    # -----------------------------
+    # Panel lateral '+' (animación)
+    # -----------------------------
+    def _place_add_panel(self):
+        try:
+            r = self.rect()
+            w = 280
+            h = r.height()
+            x = r.width() - w
+            y = 0
+            self._add_side_panel.setGeometry(x, y, w, h)
+            self._panel_overlay.setGeometry(0, 0, r.width() - w, h)
+        except Exception:
+            pass
+
+    def resizeEvent(self, event):  # noqa: N802
+        try:
+            super().resizeEvent(event)
+        except Exception:
+            pass
+        try:
+            if hasattr(self, '_add_side_panel') and self._add_side_panel.isVisible():
+                self._place_add_panel()
+        except Exception:
+            pass
+
+    def _show_add_panel(self):
+        try:
+            self._place_add_panel()
+            end_rect = self._add_side_panel.geometry()
+            start_rect = QtCore.QRect(end_rect.right(), end_rect.top(), 0, end_rect.height())
+            self._add_side_panel.setGeometry(start_rect)
+            self._add_side_panel.show()
+            self._panel_overlay.show()
+            anim = QtCore.QPropertyAnimation(self._add_side_panel, b"geometry")
+            anim.setDuration(200)
+            anim.setEasingCurve(QtCore.QEasingCurve.OutCubic)
+            anim.setStartValue(start_rect)
+            anim.setEndValue(end_rect)
+            self._add_panel_anim = anim
+            anim.start()
+        except Exception:
+            pass
+
+    def _hide_add_panel(self):
+        try:
+            start_rect = self._add_side_panel.geometry()
+            end_rect = QtCore.QRect(start_rect.right(), start_rect.top(), 0, start_rect.height())
+            anim = QtCore.QPropertyAnimation(self._add_side_panel, b"geometry")
+            anim.setDuration(160)
+            anim.setEasingCurve(QtCore.QEasingCurve.InCubic)
+            anim.setStartValue(start_rect)
+            anim.setEndValue(end_rect)
+            def _after():
+                try:
+                    self._add_side_panel.hide()
+                    self._panel_overlay.hide()
+                except Exception:
+                    pass
+            anim.finished.connect(_after)
+            self._add_panel_anim = anim
+            anim.start()
+        except Exception:
+            pass
+
+    def _on_tab_close_requested(self, index: int) -> None:
+        """Cierra pestañas de trabajo, protegiendo la pestaña fija 'Nodos'."""
+        try:
+            w = self.work_tabs.widget(index)
+            if w is None:
+                return
+            # No permitir cerrar la pestaña especial '+'
+            if hasattr(self, '_add_tab_placeholder') and w is getattr(self, '_add_tab_placeholder', None):
+                return
+            if w is self.node_tab:
+                # No permitir cerrar la pestaña principal de nodos
+                try:
+                    self.statusBar().showMessage("La pestaña 'Nodos' no se puede cerrar", 1800)
+                except Exception:
+                    pass
+                return
+            self.work_tabs.removeTab(index)
+        except Exception:
+            pass
+
+    def _open_code_editor_window(self) -> None:
+        """Abre un Editor de Código clásico en nueva ventana."""
+        try:
+            w = CodeEditorWindow(self)
+            w.show()
+            self._child_windows.append(w)
+            # Limpiar referencia al cerrarse
+            w.destroyed.connect(lambda _=None, win=w: self._child_windows.remove(win) if win in self._child_windows else None)
+            self.statusBar().showMessage("Editor de Código abierto", 1200)
+        except Exception:
+            pass
+
+    def _open_nodes_editor_window_clone(self) -> None:
+        """Abre un Editor de Nodos en nueva ventana clonando el grafo actual."""
+        try:
+            initial = {}
+            try:
+                if hasattr(self.node_view, 'export_graph'):
+                    initial = self.node_view.export_graph()  # type: ignore[attr-defined]
+            except Exception:
+                initial = {}
+            w = BlueprintEditorWindow(initial_graph=initial, parent=self)
+            w.show()
+            self._child_windows.append(w)
+            w.destroyed.connect(lambda _=None, win=w: self._child_windows.remove(win) if win in self._child_windows else None)
+            self.statusBar().showMessage("Editor de Nodos (clonado) abierto", 1200)
+        except Exception:
+            pass
+
+    def _open_dual_editors(self) -> None:
+        """Abre editor de nodos (izquierda) y editor de código (derecha) lado a lado."""
+        try:
+            # Nodos con grafo clonado
+            initial = {}
+            try:
+                if hasattr(self.node_view, 'export_graph'):
+                    initial = self.node_view.export_graph()  # type: ignore[attr-defined]
+            except Exception:
+                initial = {}
+
+            w_nodes = BlueprintEditorWindow(initial_graph=initial, parent=self)
+            w_code = CodeEditorWindow(self)
+            w_nodes.show()
+            w_code.show()
+
+            # Posicionar lado a lado según pantalla disponible
+            try:
+                screen = QtWidgets.QApplication.primaryScreen()
+                geo = screen.availableGeometry() if screen else self.geometry()
+                total_w = geo.width()
+                total_h = geo.height()
+                half_w = max(400, int(total_w / 2))
+                left_rect = QtCore.QRect(geo.left(), geo.top(), half_w, total_h)
+                right_rect = QtCore.QRect(geo.left() + half_w, geo.top(), total_w - half_w, total_h)
+                w_nodes.setGeometry(left_rect)
+                w_code.setGeometry(right_rect)
+            except Exception:
+                base = self.frameGeometry()
+                w_nodes.move(base.topLeft() + QtCore.QPoint(10, 10))
+                w_code.move(base.topLeft() + QtCore.QPoint(40 + w_nodes.width(), 10))
+
+            # Mantener referencias
+            self._child_windows.append(w_nodes)
+            self._child_windows.append(w_code)
+            w_nodes.destroyed.connect(lambda _=None, win=w_nodes: self._child_windows.remove(win) if win in self._child_windows else None)
+            w_code.destroyed.connect(lambda _=None, win=w_code: self._child_windows.remove(win) if win in self._child_windows else None)
+
+            self.statusBar().showMessage("Editores abiertos: nodos izquierda, código derecha", 1500)
         except Exception:
             pass
 
@@ -573,7 +843,7 @@ class EditorWindow(QtWidgets.QMainWindow):
             self._btn_layout.clicked.connect(self.node_view.auto_layout_selection)
             self._btn_delete.clicked.connect(self.node_view.delete_selected_nodes)
             self._btn_blueprint.clicked.connect(self._open_blueprint_window)
-            self._btn_output_preview.clicked.connect(self._open_output_preview)
+            # Acción de Preview de Outputs eliminada
             # Primer refresco
             self._refresh_node_status_widgets()
         except Exception:
@@ -651,82 +921,7 @@ class EditorWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
 
-    # -----------------------------
-    # Preview de Outputs (ventana)
-    # -----------------------------
-    def _open_output_preview(self) -> None:
-        try:
-            # Mantener referencia para evitar GC y reutilizar ventana
-            if not hasattr(self, '_output_preview_win') or self._output_preview_win is None:
-                self._output_preview_win = OutputPreviewWindow(self.node_view, parent=self)
-            win = self._output_preview_win
-            # Si hay un único nodo seleccionado, crear un Monitor Output autoconectado
-            try:
-                scene = getattr(self.node_view, '_scene', None)
-                selected_nodes = [it for it in (scene.selectedItems() if scene else []) if isinstance(it, NodeItem)]
-                if len(selected_nodes) == 1:
-                    src = selected_nodes[0]
-                    # Posicionar el monitor a la derecha del nodo seleccionado
-                    pos = src.scenePos()
-                    mon_x = float(pos.x() + 140.0)
-                    mon_y = float(pos.y())
-                    mon = self.node_view.add_node_with_ports(
-                        title="Monitor",
-                        x=mon_x,
-                        y=mon_y,
-                        node_type="output",
-                        inputs=[{"name": "input", "kind": "data", "multi": True}],
-                        outputs=["output"],
-                        content=""
-                    )
-                    if mon is not None:
-                        try:
-                            setattr(mon, 'forward_output', True)
-                        except Exception:
-                            pass
-                        # Autoconectar primer OUT del seleccionado al IN del monitor
-                        try:
-                            start_port = (src.output_ports[0]['name'] if getattr(src, 'output_ports', None) else 'output')
-                            end_port = (mon.input_ports[0]['name'] if getattr(mon, 'input_ports', None) else 'input')
-                            self.node_view.add_connection(src, mon, start_port=start_port, end_port=end_port)
-                        except Exception:
-                            pass
-                        # Intentar seleccionar y centrar
-                        try:
-                            mon.setSelected(True)
-                            self.node_view.centerOn(mon)
-                        except Exception:
-                            pass
-                        # Enfocar pestaña del monitor en el Preview si existe
-                        try:
-                            win.refresh_tabs()
-                            # Buscar editor asociado al monitor
-                            ed = getattr(win, '_editors', {}).get(mon)
-                            if ed is not None:
-                                for i in range(win.tabs.count()):
-                                    if win.tabs.widget(i) is ed:
-                                        win.tabs.setCurrentIndex(i)
-                                        break
-                        except Exception:
-                            pass
-            except Exception:
-                pass
-            # Forzar evaluación del grafo para que el Preview tenga datos al abrir
-            try:
-                self.node_view.evaluate_graph()
-            except Exception:
-                pass
-            # Refrescar contenidos por si hay buffers iniciales
-            try:
-                win.refresh_tabs()
-                win.refresh_contents()
-            except Exception:
-                pass
-            win.show()
-            win.raise_()
-            win.activateWindow()
-        except Exception:
-            pass
+    # Preview de Outputs eliminado
 
 
 __all__ = ["EditorWindow"]

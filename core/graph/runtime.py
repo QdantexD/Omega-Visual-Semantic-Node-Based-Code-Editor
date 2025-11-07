@@ -64,12 +64,25 @@ class GraphRuntime:
             pass
 
         for _ in range(max_iters):
-            # Calcular salidas de cada nodo
+            # Calcular salidas solo de nodos que lo necesiten (lazy)
             for n in nodes:
                 try:
-                    outputs = n.compute_output_values()
-                    if isinstance(outputs, dict):
-                        n.output_values = outputs
+                    # Decidir si recomputar
+                    recompute = bool(getattr(n, 'is_dirty', True))
+                    try:
+                        current_sig = n._inputs_signature() if hasattr(n, '_inputs_signature') else None
+                        last_sig = getattr(n, '_last_inputs_hash', None)
+                        if current_sig is not None and current_sig != last_sig:
+                            recompute = True
+                    except Exception:
+                        pass
+                    # Asegurar primera computación si no hay cache
+                    if not isinstance(getattr(n, '_output_cache', None), dict):
+                        recompute = True
+                    if recompute:
+                        outputs = n.compute_output_values()
+                        if isinstance(outputs, dict):
+                            n.output_values = outputs
                 except Exception:
                     # Ignorar nodos que fallen al computar
                     pass
@@ -85,9 +98,15 @@ class GraphRuntime:
                     val = None
                     if hasattr(start, 'output_values'):
                         val = (start.output_values or {}).get(start_port, None)
-                    # Si no hay output_values, usar contenido como fallback
-                    if val is None and hasattr(start, 'to_plain_text'):
-                        val = start.to_plain_text()
+                    # Fallback: sólo para nodos cuyo OUT es su contenido visible
+                    # Evita inyectar el texto del nodo de tipo 'process' antes de calcular.
+                    if val is None:
+                        try:
+                            start_type = str(getattr(start, 'node_type', '')).lower()
+                        except Exception:
+                            start_type = ''
+                        if start_type in ('generic', 'input', 'variable', 'group_input', 'combine') and hasattr(start, 'to_plain_text'):
+                            val = start.to_plain_text()
                     # Entregar al destino aplicando la lógica del conector
                     if hasattr(end, 'receive_input_value'):
                         prev = (end.input_values or {}).get(end_port, None)
@@ -97,6 +116,26 @@ class GraphRuntime:
                             new_val = val
                         end.receive_input_value(end_port, new_val)
                         now = (end.input_values or {}).get(end_port, None)
+                        # Pulso visual si el valor cambia
+                        try:
+                            if now != prev and hasattr(conn, 'pulse_on_value'):
+                                conn.pulse_on_value()
+                        except Exception:
+                            pass
+                        # Reflejar de inmediato en nodos Output/Group Output
+                        try:
+                            end_type = str(getattr(end, 'node_type', '')).lower()
+                            if end_type in ('output', 'group_output'):
+                                if now is not None:
+                                    text = None
+                                    if isinstance(now, list):
+                                        text = "\n".join([str(v) for v in now if v is not None])
+                                    else:
+                                        text = str(now)
+                                    if text is not None and hasattr(end, 'update_from_text'):
+                                        end.update_from_text(text)
+                        except Exception:
+                            pass
                         if now != prev:
                             changed = True
                 except Exception:
@@ -140,3 +179,9 @@ class GraphRuntime:
                             n.update_from_text(combined)
             except Exception:
                 pass
+        # Forzar repintado del viewport tras la evaluación
+        try:
+            if hasattr(self.view, 'viewport'):
+                self.view.viewport().update()
+        except Exception:
+            pass

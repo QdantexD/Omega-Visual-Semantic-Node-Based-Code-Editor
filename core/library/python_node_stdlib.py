@@ -416,6 +416,11 @@ def get_python_catalog() -> Dict[str, List[Dict[str, Any]]]:
     Cada entrada tiene: name, description, template (código sugerido).
     Se organiza por categorías: "Strings", "Math", "Control", "Funciones".
     """
+    base = [
+        {"name": "Input", "description": "Entrada básica de Python", "template": "", "node_type": "input"},
+        {"name": "Process", "description": "Proceso básico Python", "template": "output = input", "node_type": "process"},
+        {"name": "Output", "description": "Salida con ejecución de código", "template": "print(input)\n# Usa variables conectadas (p.ej. nombre, edad)\noutput = str(input)", "node_type": "output"},
+    ]
     strings = [
         {"name": "str.upper", "description": "Mayúsculas", "template": "output = str(input).upper()"},
         {"name": "str.lower", "description": "Minúsculas", "template": "output = str(input).lower()"},
@@ -444,6 +449,7 @@ def get_python_catalog() -> Dict[str, List[Dict[str, Any]]]:
     ]
 
     return {
+        "Base": base,
         "Strings": strings,
         "Math": math_cat,
         "Control": control,

@@ -3,8 +3,8 @@ from PySide6.QtWidgets import (
     QPlainTextEdit, QWidget, QGraphicsProxyWidget, QGraphicsDropShadowEffect, QPushButton
 )
 from PySide6.QtCore import QRectF, Qt, QPointF, QSize, QTimer
-from PySide6.QtGui import QBrush, QColor, QPen, QFont, QPainter, QPainterPath, QLinearGradient
-import sys
+from PySide6.QtGui import QBrush, QColor, QPen, QFont, QPainter, QPainterPath, QLinearGradient, QPainterPathStroker
+import sys, io, traceback, ast
 
 GRID_SIZE = 20  # Snap al grid
 
@@ -180,6 +180,20 @@ class NodeItem(QGraphicsRectItem):
         # Ícono opcional en el encabezado (establecido por la vista)
         self.header_icon = None
 
+        # --- Optimización y metadata ---
+        # Hint de pureza (nodos puros pueden cachearse por firma de inputs)
+        self.purity_hint = "pure"  # "pure" | "impure"
+        # Costo relativo para profiling futuro
+        self.execution_cost = 1.0
+        # Anotaciones de tipo por puerto (opcional)
+        self._type_annotations: dict[str, str] = {}
+        # Estado de suciedad/cambio: true al crear o al modificar inputs/propiedades relevantes
+        self.is_dirty = True
+        # Firma de inputs+contenido para cache estable
+        self._last_inputs_hash = None
+        # Cache de outputs cuando el nodo es puro
+        self._output_cache: dict | None = None
+
         # Padding del área de contenido para evitar solaparse con etiquetas de puertos
         self._content_padding_left = 56
         self._content_padding_right = 56
@@ -303,6 +317,24 @@ class NodeItem(QGraphicsRectItem):
         except Exception:
             self._inline_syntax = None
 
+        # Panel de debug (solo visual, no editable) para nodos Python
+        self.debug_item = QGraphicsTextItem(self)
+        try:
+            mono_dbg = QFont("Consolas", 9)
+        except Exception:
+            mono_dbg = QFont("Courier New", 9)
+        self.debug_item.setFont(mono_dbg)
+        self.debug_item.setDefaultTextColor(QColor("#93c5fd"))  # azul claro para logs
+        self.debug_item.setTextInteractionFlags(Qt.NoTextInteraction)
+        self.debug_item.setFlag(QGraphicsItem.ItemIsFocusable, False)
+        try:
+            self.debug_item.setFlag(QGraphicsItem.ItemIgnoresTransformations, True)
+        except Exception:
+            pass
+        self.debug_item.setVisible(False)
+        self._debug_buffer = ""
+        self._debug_enabled_manual = False  # reserva para futuros toggles
+
     def _on_inline_text_changed(self):
         """Arranca el temporizador de evaluación en vivo cuando cambia el texto."""
         try:
@@ -316,6 +348,8 @@ class NodeItem(QGraphicsRectItem):
         try:
             # Actualizar el atributo de contenido con el texto actual
             self.content = (self.content_editor.toPlainText() or "").strip()
+            # Marcar el nodo como sucio para forzar reevaluación/cambio de firma
+            self.is_dirty = True
         except Exception:
             pass
         # Solicitar evaluación del grafo desde la(s) vista(s) que contienen este nodo
@@ -373,6 +407,17 @@ class NodeItem(QGraphicsRectItem):
         except Exception:
             pass
         # Botón de salir eliminado: no hay posicionamiento
+
+        # Posicionar panel de debug debajo del contenido
+        try:
+            dbg_h = max(24.0, min(80.0, content_h * 0.40))
+            dbg_y = content_top_y + max(6.0, content_h - dbg_h)
+            self.debug_item.setPos(padding_l, dbg_y)
+            self.debug_item.setTextWidth(content_w)
+            # Visibilidad: solo Python
+            self._update_debug_visibility()
+        except Exception:
+            pass
 
     def _auto_resize_to_content(self):
         """Ajusta altura (y opcionalmente ancho) del nodo para encajar el contenido."""
@@ -585,24 +630,75 @@ class NodeItem(QGraphicsRectItem):
             pass
 
         # Colores dinámicos y trazo sobrio
+        # Borde base sobrio; no cambiar a ámbar cuando está seleccionado.
         pen_color = QColor(self._border_color)
-        if self.isSelected():
-            pen_color = QColor(self._selected_border_color)
+        selected = self.isSelected()
         if self._editing:
-            # Resaltado sutil en edición
-            pen_color = QColor("#f59e0b")  # amber
+            # En edición no alteramos el borde; se resaltará con glow ligero abajo.
+            selected = True
 
-        # Fondo con borde (doble trazo sutil)
+        # Fondo con borde (alineado a píxel para bordes nítidos)
+        # Usamos rectángulos ajustados 0.5px para evitar el blur del antialias.
+        outer_rect = rect.adjusted(0.5, 0.5, -0.5, -0.5)
         base_path = QPainterPath()
-        base_path.addRoundedRect(rect, self.radius, self.radius)
-        painter.setPen(QPen(pen_color, 1.8 if not self._editing else 2.6))
+        base_path.addRoundedRect(outer_rect, self.radius, self.radius)
+        main_pen = QPen(pen_color, 1.6 if not self._editing else 2.2)
+        main_pen.setJoinStyle(Qt.RoundJoin)
+        main_pen.setCapStyle(Qt.RoundCap)
+        painter.setPen(main_pen)
         painter.setBrush(QBrush(self._bg_color if not self._editing else QColor("#0b1220")))
         painter.drawPath(base_path)
-        # Inner stroke para profundidad
-        inner_rect = rect.adjusted(1, 1, -1, -1)
-        painter.setPen(QPen(QColor("#1e293b"), 1))
+        # Trazo externo tenue para definición del borde
+        hair_pen = QPen(QColor(14, 18, 28, 180), 1)
+        hair_pen.setJoinStyle(Qt.RoundJoin)
+        painter.setPen(hair_pen)
         painter.setBrush(Qt.NoBrush)
-        painter.drawRoundedRect(inner_rect, self.radius - 1, self.radius - 1)
+        painter.drawRoundedRect(outer_rect, self.radius, self.radius)
+        # Glow de selección neón con anillos redondeados perfectos
+        if selected:
+            painter.save()
+            neon_core = QColor(34, 197, 94, 255)
+            neon_mid  = QColor(34, 197, 94, 170)
+            neon_far  = QColor(34, 197, 94, 90)
+            painter.setCompositionMode(QPainter.CompositionMode_Screen)
+            painter.setPen(Qt.NoPen)
+            # Generamos el anillo desde el contorno exacto del borde
+            def ring_from_stroke(width: float) -> QPainterPath:
+                stroker = QPainterPathStroker()
+                stroker.setWidth(width)
+                stroker.setJoinStyle(Qt.RoundJoin)
+                stroker.setCapStyle(Qt.RoundCap)
+                stroke_path = stroker.createStroke(base_path)
+                return stroke_path.subtracted(base_path)
+            ring_far  = ring_from_stroke(22.0)
+            ring_mid  = ring_from_stroke(14.0)
+            ring_core = ring_from_stroke(7.0)
+            painter.setBrush(QBrush(neon_far))
+            painter.drawPath(ring_far)
+            painter.setBrush(QBrush(neon_mid))
+            painter.drawPath(ring_mid)
+            painter.setBrush(QBrush(neon_core))
+            painter.drawPath(ring_core)
+            painter.restore()
+        # Inner stroke para profundidad (ligero)
+        inner_rect = rect.adjusted(1.5, 1.5, -1.5, -1.5)
+        inner_pen = QPen(QColor("#1e293b"), 1)
+        inner_pen.setJoinStyle(Qt.RoundJoin)
+        painter.setPen(inner_pen)
+        painter.setBrush(Qt.NoBrush)
+        painter.drawRoundedRect(inner_rect, max(self.radius - 1, 2), max(self.radius - 1, 2))
+
+        # Indicadores de optimización: estado sucio
+        try:
+            # Punto naranja semitransparente si el nodo está sucio
+            if bool(getattr(self, 'is_dirty', False)):
+                dot_r = 4
+                dot_rect = QRectF(rect.right() - 12, rect.top() + 6, dot_r * 2, dot_r * 2)
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(QBrush(QColor(245, 158, 11, 180)))
+                painter.drawEllipse(dot_rect)
+        except Exception:
+            pass
 
         # Fondo tipo "card" para el preview de texto cuando NO está en edición
         try:
@@ -630,20 +726,26 @@ class NodeItem(QGraphicsRectItem):
                 )
                 # Gradiente sutil para mejorar profundidad y legibilidad del texto
                 from PySide6.QtGui import QLinearGradient
-                grad_card = QLinearGradient(content_rect.topLeft(), content_rect.bottomLeft())
+                # Alineamos el borde a 0.5px para evitar desenfoque por antialias
+                card_outer = content_rect.adjusted(0.5, 0.5, -0.5, -0.5)
+                grad_card = QLinearGradient(card_outer.topLeft(), card_outer.bottomLeft())
                 grad_card.setColorAt(0.0, QColor(21, 29, 45, 200))
                 grad_card.setColorAt(1.0, QColor(15, 22, 35, 200))
-                painter.setPen(QPen(QColor(58, 73, 90, 170), 1))
+                pen_card = QPen(QColor(58, 73, 90, 170), 1)
+                pen_card.setJoinStyle(Qt.RoundJoin)
+                painter.setPen(pen_card)
                 painter.setBrush(QBrush(grad_card))
-                painter.drawRoundedRect(content_rect, 9, 9)
+                painter.drawRoundedRect(card_outer, 9, 9)
                 # Trazo interno para efecto de "inner shadow" muy leve
-                inner = content_rect.adjusted(1, 1, -1, -1)
-                painter.setPen(QPen(QColor(25, 33, 50, 120), 1))
+                inner = content_rect.adjusted(1.5, 1.5, -1.5, -1.5)
+                inner_pen = QPen(QColor(25, 33, 50, 120), 1)
+                inner_pen.setJoinStyle(Qt.RoundJoin)
+                painter.setPen(inner_pen)
                 painter.setBrush(Qt.NoBrush)
                 painter.drawRoundedRect(inner, 8, 8)
                 # Línea de brillo superior muy tenue
                 painter.setPen(QPen(QColor(180, 190, 200, 24), 1))
-                painter.drawLine(content_rect.topLeft() + QPointF(2, 1), content_rect.topRight() + QPointF(-2, 1))
+                painter.drawLine(card_outer.topLeft() + QPointF(2, 1), card_outer.topRight() + QPointF(-2, 1))
                 # El texto se dibuja con content_item (nítido, sin escalado). No duplicar aquí.
         except Exception:
             pass
@@ -668,36 +770,27 @@ class NodeItem(QGraphicsRectItem):
 
         # Ampliación visual de bordes al pasar el cursor (simple y sutil)
         if self._hovered:
-            outer_rect = rect.adjusted(-2, -2, 2, 2)
-            painter.setPen(QPen(QColor("#334155"), 2))
+            glow_rect = rect.adjusted(-1, -1, 1, 1)
+            glow_pen = QPen(QColor(51, 65, 85, 160), 2)
+            glow_pen.setJoinStyle(Qt.RoundJoin)
+            painter.setPen(glow_pen)
             painter.setBrush(Qt.NoBrush)
-            painter.drawRoundedRect(outer_rect, self.radius + 1, self.radius + 1)
+            painter.drawRoundedRect(glow_rect, self.radius + 1, self.radius + 1)
 
         # Barra de título con degradado suave
         title_rect = QRectF(rect)
         title_rect.setHeight(self.title_h)
+        title_outer = title_rect.adjusted(0.5, 0.5, -0.5, 0)
         from PySide6.QtGui import QLinearGradient
-        grad = QLinearGradient(title_rect.topLeft(), title_rect.bottomLeft())
-        grad.setColorAt(0.0, QColor("#1f2937"))
-        grad.setColorAt(1.0, QColor("#242e3d"))
+        grad = QLinearGradient(title_outer.topLeft(), title_outer.bottomLeft())
+        # Usar un fondo uniforme para coherencia con el cuerpo del nodo
+        title_bg = QColor(self._title_bg_color)
+        grad.setColorAt(0.0, title_bg)
+        grad.setColorAt(1.0, title_bg)
         painter.setPen(Qt.NoPen)
         painter.setBrush(QBrush(grad))
-        painter.drawRoundedRect(title_rect, min(self.radius, self.title_h / 2), min(self.radius, self.title_h / 2))
-        # Acento superior fino con identidad por lenguaje
-        try:
-            lang = str(getattr(self, "_language", "") or "").lower()
-        except Exception:
-            lang = ""
-        brand = QColor("#3b82f6")
-        if "python" in lang:
-            brand = QColor("#22c55e")  # verde agua para Python
-        elif "cpp" in lang or "c++" in lang:
-            brand = QColor("#60a5fa")  # azul para C++
-        elif "javascript" in lang or "js" in lang:
-            brand = QColor("#f59e0b")  # ámbar para JS
-        accent = QColor("#f59e0b") if self.isSelected() else brand
-        painter.setPen(QPen(accent, 2))
-        painter.drawLine(title_rect.topLeft() + QPointF(2, 1), title_rect.topRight() + QPointF(-2, 1))
+        painter.drawRoundedRect(title_outer, min(self.radius, self.title_h / 2), min(self.radius, self.title_h / 2))
+        # Acento superior eliminado para un diseño más sobrio y coherente
 
         # Ícono del encabezado (si está definido), alineado a la izquierda, nítido en cualquier zoom
         try:
@@ -716,9 +809,7 @@ class NodeItem(QGraphicsRectItem):
         except Exception:
             pass
 
-        # Separador
-        painter.setPen(QPen(QColor("#1f2937"), 1))
-        painter.drawLine(title_rect.bottomLeft(), title_rect.bottomRight())
+        # Separador inferior eliminado para evitar líneas extras
 
         # Overlay hover eliminado para evitar resaltados blancos molestos
 
@@ -1241,9 +1332,65 @@ class NodeItem(QGraphicsRectItem):
     def receive_input_value(self, port_name: str, value: object):
         """Recibe un valor en un puerto de entrada y lo almacena."""
         try:
+            prev = self.input_values.get(port_name, None)
             self.input_values[port_name] = value
+            # Marcar suciedad sólo si hubo cambio real
+            try:
+                if prev != value:
+                    self.is_dirty = True
+            except Exception:
+                self.is_dirty = True
         except Exception:
             pass
+
+    # --- Type annotations y pureza ---
+    def set_type_annotation(self, port_name: str, dtype: str):
+        """Define el tipo esperado de un puerto (hint suave)."""
+        try:
+            self._type_annotations[str(port_name)] = str(dtype)
+            self.update()
+        except Exception:
+            pass
+
+    def get_type_annotation(self, port_name: str) -> str:
+        """Obtiene el tipo esperado de un puerto (o 'any')."""
+        try:
+            return self._type_annotations.get(str(port_name), "any")
+        except Exception:
+            return "any"
+
+    def mark_as_pure(self):
+        """Marca el nodo como puro (cacheable por firma de inputs)."""
+        self.purity_hint = "pure"
+
+    def mark_as_impure(self):
+        """Marca el nodo como impuro (siempre se recomputa)."""
+        self.purity_hint = "impure"
+
+    # --- Helpers de cache ---
+    def _normalize_val(self, v: object):
+        try:
+            if isinstance(v, list):
+                return tuple(v)
+            if isinstance(v, dict):
+                return tuple(sorted(v.items()))
+            return v
+        except Exception:
+            return v
+
+    def _inputs_signature(self) -> tuple:
+        """Firma simple basada en tipo, contenido e inputs actuales."""
+        try:
+            items = []
+            for k, v in sorted((self.input_values or {}).items(), key=lambda kv: kv[0]):
+                items.append((str(k), self._normalize_val(v)))
+            return (
+                str(getattr(self, 'node_type', 'generic') or 'generic').lower(),
+                str(getattr(self, 'content', '') or ''),
+                tuple(items)
+            )
+        except Exception:
+            return (str(getattr(self, 'node_type', 'generic') or 'generic').lower(), str(getattr(self, 'content', '') or ''), ())
 
     def _safe_eval_process(self, expr: str, input_val: object):
         """Evalúa de forma segura una expresión simple con la variable 'input'.
@@ -1275,39 +1422,238 @@ class NodeItem(QGraphicsRectItem):
         # Soporte ampliado: si parece bloque/función, usar exec y buscar 'process'/'transform'/'main' o variables 'output'/'result'.
         is_block = ("\n" in code) or ("def " in code) or ("=" in code)
         if is_block:
+            # Capturar stdout/stderr si es nodo Python (debug no editable)
+            py_debug = self._is_python_node()
+            out_buf, err_buf = io.StringIO(), io.StringIO()
+            old_out, old_err = sys.stdout, sys.stderr
+            if py_debug:
+                sys.stdout, sys.stderr = out_buf, err_buf
+                self._clear_debug()
+                self._append_debug("[Ejecutando bloque Python...]\n")
             try:
                 exec(code, safe_globals, safe_locals)
                 for fn_name in ("process", "transform", "main"):
                     fn = safe_locals.get(fn_name)
                     if callable(fn):
-                        return fn(safe_locals.get('input'))
+                        res = fn(safe_locals.get('input'))
+                        if py_debug:
+                            self._append_debug(f"→ Resultado: {res}\n")
+                        return res
                 for var_name in ("output", "result", "res"):
                     if var_name in safe_locals:
-                        return safe_locals[var_name]
+                        res = safe_locals[var_name]
+                        if py_debug:
+                            self._append_debug(f"→ Resultado: {res}\n")
+                        return res
                 # Intentar evaluar la última línea como expresión
                 lines = [ln for ln in code.splitlines() if ln.strip()]
                 if lines:
                     last = lines[-1]
                     try:
-                        return eval(last, safe_globals, safe_locals)
-                    except Exception:
-                        pass
-            except Exception:
-                pass
+                        res = eval(last, safe_globals, safe_locals)
+                        if py_debug:
+                            self._append_debug(f"→ Resultado: {res}\n")
+                        return res
+                    except Exception as e:
+                        if py_debug:
+                            self._append_debug(f"[Error eval última línea] {e}\n")
+            except Exception as e:
+                if py_debug:
+                    tb = traceback.format_exc()
+                    self._append_debug(f"[Excepción] {e}\n{tb}\n")
+            finally:
+                if py_debug:
+                    sys.stdout, sys.stderr = old_out, old_err
+                    out_txt = out_buf.getvalue().strip()
+                    err_txt = err_buf.getvalue().strip()
+                    if out_txt:
+                        self._append_debug(out_txt + "\n")
+                    if err_txt:
+                        self._append_debug("[stderr] " + err_txt + "\n")
         # Expresión simple: eval directo con 'input'
+        py_debug = self._is_python_node()
+        out_buf, err_buf = io.StringIO(), io.StringIO()
+        old_out, old_err = sys.stdout, sys.stderr
+        if py_debug:
+            sys.stdout, sys.stderr = out_buf, err_buf
+            self._clear_debug()
+            self._append_debug("[Ejecutando expresión Python...]\n")
         try:
-            return eval(code, safe_globals, safe_locals)
-        except Exception:
+            res = eval(code, safe_globals, safe_locals)
+            if py_debug:
+                self._append_debug(f"→ Resultado: {res}\n")
+            return res
+        except Exception as e:
+            if py_debug:
+                tb = traceback.format_exc()
+                self._append_debug(f"[Excepción] {e}\n{tb}\n")
             # Fallback más útil: concatenar el texto al input para no perderlo
             try:
                 expr_text = str(code or "")
                 base = "" if input_val is None else str(input_val)
                 if expr_text.strip():
                     sep = "\n" if base and not base.endswith("\n") else ""
-                    return f"{base}{sep}{expr_text}"
+                    res = f"{base}{sep}{expr_text}"
+                    if py_debug:
+                        self._append_debug(f"→ Resultado: {res}\n")
+                    return res
             except Exception:
                 pass
             return input_val
+        finally:
+            if py_debug:
+                sys.stdout, sys.stderr = old_out, old_err
+                out_txt = out_buf.getvalue().strip()
+                err_txt = err_buf.getvalue().strip()
+                if out_txt:
+                    self._append_debug(out_txt + "\n")
+                if err_txt:
+                    self._append_debug("[stderr] " + err_txt + "\n")
+
+    def _safe_exec_python_with_vars(self, code: str, inputs_map: dict) -> object:
+        """Ejecuta de forma segura código Python para nodos Output.
+
+        - Usa variables conectadas (VariableNode) cuando el lenguaje es Python.
+        - Expone `input` (primer valor de entrada) y `inputs` (mapa de puertos).
+        - Captura stdout/stderr al panel de depuración del nodo.
+        - Retorna `output`/`result`/`res` si existen; si no, el texto impreso o None.
+        """
+        code = str(code or "")
+        # Preparar entorno seguro
+        safe_builtins = {
+            'len': len, 'str': str, 'int': int, 'float': float, 'bool': bool,
+            'abs': abs, 'min': min, 'max': max, 'sum': sum, 'range': range,
+            'list': list, 'dict': dict, 'print': print
+        }
+        safe_globals = {'__builtins__': safe_builtins}
+
+        # Resolver input primario y normalizar mapa de entradas
+        primary_input = None
+        try:
+            if inputs_map:
+                # Tomar la primera entrada definida como primaria
+                first_key = next(iter(inputs_map.keys()), None)
+                val = inputs_map.get(first_key)
+                if isinstance(val, list):
+                    # Usar el último no nulo
+                    for sv in reversed(val):
+                        if sv is not None:
+                            primary_input = sv
+                            break
+                else:
+                    primary_input = val
+        except Exception:
+            pass
+
+        # Construir locals con entradas
+        safe_locals = {'input': primary_input, 'inputs': {}}
+        try:
+            # Normalizar listas en cada puerto a último valor no nulo
+            for k, v in (inputs_map or {}).items():
+                if isinstance(v, list):
+                    norm = None
+                    for sv in reversed(v):
+                        if sv is not None:
+                            norm = sv
+                            break
+                    safe_locals['inputs'][k] = norm
+                else:
+                    safe_locals['inputs'][k] = v
+        except Exception:
+            pass
+
+        # Añadir variables provenientes de VariableNode conectados (solo Python)
+        try:
+            for conn in getattr(self, 'connections', []) or []:
+                if getattr(conn, 'end_item', None) is self:
+                    upstream = getattr(conn, 'start_item', None)
+                    if upstream and hasattr(upstream, 'get_variable_info'):
+                        info = upstream.get_variable_info()
+                        if str(info.get('language', '')).lower() != 'python':
+                            continue
+                        name = str(info.get('name', '') or '').strip()
+                        if not name:
+                            continue
+                        raw_val = getattr(upstream, 'variable_value', None)
+                        if raw_val is None:
+                            raw_val = info.get('value')
+                        val = raw_val
+                        # Intentar convertir a tipo Python real
+                        try:
+                            if isinstance(raw_val, str):
+                                val = ast.literal_eval(raw_val)
+                        except Exception:
+                            # Valores como True/False o cadenas no cotizadas
+                            try:
+                                low = str(raw_val).strip()
+                                if low.lower() in {'true','false'}:
+                                    val = (low.lower() == 'true')
+                                else:
+                                    val = raw_val
+                            except Exception:
+                                val = raw_val
+                        safe_locals[name] = val
+        except Exception:
+            pass
+
+        py_debug = self._is_python_node()
+        out_buf, err_buf = io.StringIO(), io.StringIO()
+        old_out, old_err = sys.stdout, sys.stderr
+        if py_debug:
+            sys.stdout, sys.stderr = out_buf, err_buf
+            self._clear_debug()
+            self._append_debug("[Ejecutando código Python en Output...]\n")
+        try:
+            exec(code, safe_globals, safe_locals)
+            # Si el usuario define una función estándar, intentar llamarla
+            for fn_name in ("process", "transform", "main"):
+                fn = safe_locals.get(fn_name)
+                if callable(fn):
+                    try:
+                        res = fn(safe_locals.get('input'))
+                        if py_debug:
+                            self._append_debug(f"→ Resultado: {res}\n")
+                        return res
+                    except Exception as e:
+                        if py_debug:
+                            self._append_debug(f"[Error invocando {fn_name}] {e}\n")
+            # Variables de resultado comunes
+            for var_name in ("output", "result", "res"):
+                if var_name in safe_locals:
+                    res = safe_locals[var_name]
+                    if py_debug:
+                        self._append_debug(f"→ Resultado: {res}\n")
+                    return res
+            # Como último recurso, evaluar la última línea si parece expresión
+            lines = [ln for ln in code.splitlines() if ln.strip()]
+            if lines:
+                last = lines[-1]
+                try:
+                    res = eval(last, safe_globals, safe_locals)
+                    if py_debug:
+                        self._append_debug(f"→ Resultado: {res}\n")
+                    return res
+                except Exception:
+                    pass
+            # Si no hay valor, devolver lo impreso (si existe)
+            out_txt = out_buf.getvalue().strip()
+            if out_txt:
+                return out_txt
+            return None
+        except Exception as e:
+            if py_debug:
+                tb = traceback.format_exc()
+                self._append_debug(f"[Excepción] {e}\n{tb}\n")
+            return None
+        finally:
+            if py_debug:
+                sys.stdout, sys.stderr = old_out, old_err
+                out_txt = out_buf.getvalue().strip()
+                err_txt = err_buf.getvalue().strip()
+                if out_txt:
+                    self._append_debug(out_txt + "\n")
+                if err_txt:
+                    self._append_debug("[stderr] " + err_txt + "\n")
 
     def compute_output_values(self) -> dict:
         """Calcula los valores de salida del nodo según su tipo y entradas.
@@ -1320,6 +1666,14 @@ class NodeItem(QGraphicsRectItem):
         - combine: concatena todas las entradas y su propio contenido
         """
         node_type = str(getattr(self, 'node_type', 'generic') or 'generic').lower()
+        # Cache rápido para nodos puros
+        try:
+            if self.purity_hint == "pure":
+                sig = self._inputs_signature()
+                if self._last_inputs_hash == sig and isinstance(self._output_cache, dict):
+                    return dict(self._output_cache)
+        except Exception:
+            pass
         result = dict(self.output_values or {})
 
         # Si el nodo está silenciado (muted), hace passthrough del primer input
@@ -1362,6 +1716,14 @@ class NodeItem(QGraphicsRectItem):
                 result[out_name] = val
             else:
                 result['output'] = val
+            # Guardar cache si es puro
+            try:
+                if self.purity_hint == "pure":
+                    self._output_cache = dict(result)
+                    self._last_inputs_hash = self._inputs_signature()
+                self.is_dirty = False
+            except Exception:
+                pass
             return result
 
         if node_type == 'variable':
@@ -1377,6 +1739,13 @@ class NodeItem(QGraphicsRectItem):
                 result[out_name] = val
             else:
                 result['output'] = val
+            try:
+                if self.purity_hint == "pure":
+                    self._output_cache = dict(result)
+                    self._last_inputs_hash = self._inputs_signature()
+                self.is_dirty = False
+            except Exception:
+                pass
             return result
 
         if node_type == 'process':
@@ -1403,6 +1772,13 @@ class NodeItem(QGraphicsRectItem):
                 result[out_name] = val
             else:
                 result['output'] = val
+            try:
+                if self.purity_hint == "pure":
+                    self._output_cache = dict(result)
+                    self._last_inputs_hash = self._inputs_signature()
+                self.is_dirty = False
+            except Exception:
+                pass
             return result
 
         if node_type == 'combine':
@@ -1436,10 +1812,45 @@ class NodeItem(QGraphicsRectItem):
                 result[out_name] = combined
             else:
                 result['output'] = combined
+            try:
+                if self.purity_hint == "pure":
+                    self._output_cache = dict(result)
+                    self._last_inputs_hash = self._inputs_signature()
+                self.is_dirty = False
+            except Exception:
+                pass
             return result
 
         if node_type in ('output', 'group_output'):
-            # Por defecto consume valores; si forward_output está activo, publica su contenido en OUT
+            # Para nodos Output de Python: ejecutar código usando variables e inputs.
+            try:
+                if self._is_python_node():
+                    # Construir mapa de entradas actuales
+                    inputs_map = {}
+                    for p in (self.input_ports or []):
+                        name = p.get('name', 'input')
+                        inputs_map[name] = (self.input_values or {}).get(name, None)
+                    expr = getattr(self, 'content', '') or ''
+                    val = self._safe_exec_python_with_vars(expr, inputs_map)
+                    # Publicar valor en 'output' si existe un puerto de salida
+                    if self.output_ports:
+                        out_name = self.output_ports[0]['name']
+                        result[out_name] = val
+                    else:
+                        # Aun sin puerto, guardar en cache para inspección/debug
+                        result['output'] = val
+                    # Cache/flags
+                    try:
+                        if self.purity_hint == "pure":
+                            self._output_cache = dict(result)
+                            self._last_inputs_hash = self._inputs_signature()
+                        self.is_dirty = False
+                    except Exception:
+                        pass
+                    return result
+            except Exception:
+                pass
+            # Comportamiento previo: si forward_output está activo, publicar contenido
             try:
                 if getattr(self, 'forward_output', False):
                     val = None
@@ -1466,7 +1877,48 @@ class NodeItem(QGraphicsRectItem):
             result[out_name] = val
         else:
             result['output'] = val
+        try:
+            if self.purity_hint == "pure":
+                self._output_cache = dict(result)
+                self._last_inputs_hash = self._inputs_signature()
+            self.is_dirty = False
+        except Exception:
+            pass
         return result
+
+    # --- Debug helpers ---
+    def _is_python_node(self) -> bool:
+        try:
+            lang = str(getattr(self, "_language", "") or "").lower()
+        except Exception:
+            lang = ""
+        ntype = str(getattr(self, 'node_type', '') or '').lower()
+        return ('python' in lang) or (ntype == 'python')
+
+    def _update_debug_visibility(self) -> None:
+        try:
+            enable = self._is_python_node() or self._debug_enabled_manual
+            self.debug_item.setVisible(bool(enable))
+        except Exception:
+            pass
+
+    def _clear_debug(self) -> None:
+        try:
+            self._debug_buffer = ""
+            if self.debug_item:
+                self.debug_item.setPlainText("")
+        except Exception:
+            pass
+
+    def _append_debug(self, text: str) -> None:
+        if not text:
+            return
+        try:
+            self._debug_buffer += str(text)
+            if self.debug_item:
+                self.debug_item.setPlainText(self._debug_buffer)
+        except Exception:
+            pass
     
     def add_connection(self, connection):
         """Agrega una conexión a este nodo."""

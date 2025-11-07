@@ -12,7 +12,6 @@ import math, logging, os, hashlib, shutil, difflib
 from .node_item import NodeItem
 from .group_item import GroupItem
 from .connection_item import ConnectionItem
-from .connection_editor import ConnectionEditor
 from ..nodes.variable_node import VariableNode
 from ..library.variable_library import variable_library
 from ..library.cpp_builtins_catalog import get_cpp_catalog
@@ -63,8 +62,14 @@ class NodeView(QGraphicsView):
         self._msaa_samples = 8
         # Configurar viewport inicial (OpenGL si disponible; fallback a software si falla)
         self._setup_viewport(enable_gl=self._gpu_enabled)
-        # Modo de actualización conservador para evitar repintados reentrantes
-        self.setViewportUpdateMode(QGraphicsView.MinimalViewportUpdate)
+        # Modo de actualización: usar FullViewportUpdate cuando hay GPU para animaciones fluidas
+        try:
+            if self._gpu_enabled:
+                self.setViewportUpdateMode(QGraphicsView.FullViewportUpdate)
+            else:
+                self.setViewportUpdateMode(QGraphicsView.MinimalViewportUpdate)
+        except Exception:
+            self.setViewportUpdateMode(QGraphicsView.MinimalViewportUpdate)
         # Evitar forzar WA_OpaquePaintEvent que puede chocar con algunos drivers
         try:
             self.viewport().setAttribute(Qt.WA_OpaquePaintEvent, False)
@@ -214,7 +219,7 @@ class NodeView(QGraphicsView):
         # Timer de animación para conexiones (flujo estilo Blueprint)
         try:
             self._anim_timer = QTimer(self)
-            self._anim_timer.setInterval(33)  # ~30 FPS
+            self._anim_timer.setInterval(16)  # ~60 FPS
             self._anim_timer.timeout.connect(self._tick_connection_animation)
             self._anim_timer.start()
         except Exception:
@@ -482,11 +487,9 @@ class NodeView(QGraphicsView):
         # Actualizar nodos
         start_item.add_connection(connection)
         end_item.add_connection(connection)
-        # Actualizar runtime
+        # Reevaluar el grafo y emitir señal
         try:
-            if self._runtime:
-                self._runtime.rebuild_from_view()
-                self._runtime.evaluate_all()
+            self.evaluate_graph()
         except Exception:
             pass
         
@@ -511,6 +514,11 @@ class NodeView(QGraphicsView):
                     conn.tick_animation()
             if self.connection_in_progress and hasattr(self.connection_in_progress, "tick_animation"):
                 self.connection_in_progress.tick_animation()
+            # Asegurar repintado del viewport para animaciones con OpenGL
+            try:
+                self.viewport().update()
+            except Exception:
+                pass
         except Exception:
             # Animación es no-crítica; no bloquear por errores
             pass
@@ -537,11 +545,9 @@ class NodeView(QGraphicsView):
                 connection.end_item.remove_connection(connection)
             
             self._scene.removeItem(connection)
-            # Actualizar runtime
+            # Actualizar runtime y emitir señal de grafo evaluado
             try:
-                if self._runtime:
-                    self._runtime.rebuild_from_view()
-                    self._runtime.evaluate_all()
+                self.evaluate_graph()
             except Exception:
                 pass
             # Registrar undo/redo
@@ -1027,18 +1033,10 @@ class NodeView(QGraphicsView):
                         self._auto_arrange_after_connection(self.connection_in_progress)
                     except Exception:
                         pass
-                    # Crear y mostrar editor de conexión (compacto)
+                    # Editor de conexión deshabilitado: no mostrar ventana emergente
+                    # Actualizar runtime y emitir señal para refresco en tiempo real
                     try:
-                        ed = ConnectionEditor(self.connection_in_progress)
-                        ed.show()
-                        self._last_connection_editor = ed
-                    except Exception:
-                        logger.exception("No se pudo crear ConnectionEditor")
-                    # Actualizar runtime tras completar conexión
-                    try:
-                        if hasattr(self, '_runtime') and self._runtime:
-                            self._runtime.rebuild_from_view()
-                            self._runtime.evaluate_all()
+                        self.evaluate_graph()
                     except Exception:
                         pass
                     # Registrar undo/redo para la conexión creada manualmente
@@ -1355,15 +1353,9 @@ class NodeView(QGraphicsView):
                 pass
         super().keyReleaseEvent(event)
 
+    # Editor de conexión eliminado: mantener API vacía para compatibilidad
     def open_last_connection_editor(self, expand=False):
-        """Mostrar la última ventana de conexión creada y ampliarla si se solicita."""
-        try:
-            if self._last_connection_editor:
-                self._last_connection_editor.bring_to_front()
-                if expand:
-                    self._last_connection_editor.expand()
-        except Exception:
-            logger.exception("Error abriendo última ventana de conexión")
+        return
 
     # API pública para abrir el menú TAB desde otras vistas (barra inferior)
     def open_tab_menu(self):
@@ -2302,11 +2294,12 @@ class NodeView(QGraphicsView):
             return None
 
     def _create_node_from_python_catalog_item(self, item: dict, scene_pos: QPointF):
-        """Crea un nodo Process con el snippet/plantilla del catálogo Python."""
+        """Crea un nodo Python desde el catálogo, respetando su node_type."""
         try:
             name = item.get("name", "Snippet Python")
             template = item.get("template", "output = input")
             desc = item.get("description", "Python")
+            ntype = str(item.get("node_type", "process")).lower()
 
             # Asegurar sugerencias de variables para Python en otros flujos
             try:
@@ -2317,15 +2310,36 @@ class NodeView(QGraphicsView):
             banner = f"# Catálogo Python — {name}\n# {desc}\n\n"
             content = banner + template
 
-            node = self.add_node_with_ports(
-                title="Process",
-                x=float(scene_pos.x()),
-                y=float(scene_pos.y()),
-                node_type="process",
-                inputs=[{"name": "input", "kind": "data"}],
-                outputs=[{"name": "output", "kind": "data"}],
-                content=content,
-            )
+            if ntype == "input":
+                node = self.add_node_with_ports(
+                    title="Input",
+                    x=float(scene_pos.x()),
+                    y=float(scene_pos.y()),
+                    node_type="input",
+                    inputs=[],
+                    outputs=[{"name": "output", "kind": "data"}],
+                    content=content,
+                )
+            elif ntype == "output":
+                node = self.add_node_with_ports(
+                    title="Output",
+                    x=float(scene_pos.x()),
+                    y=float(scene_pos.y()),
+                    node_type="output",
+                    inputs=[{"name": "input", "kind": "data"}],
+                    outputs=[],
+                    content=content,
+                )
+            else:
+                node = self.add_node_with_ports(
+                    title="Process",
+                    x=float(scene_pos.x()),
+                    y=float(scene_pos.y()),
+                    node_type="process",
+                    inputs=[{"name": "input", "kind": "data"}],
+                    outputs=[{"name": "output", "kind": "data"}],
+                    content=content,
+                )
             # Identidad visual del nodo Python (icono y lenguaje)
             try:
                 node._language = "python"
@@ -3204,6 +3218,12 @@ class NodeView(QGraphicsView):
             pass
         self._scene.addItem(node)
         self._apply_node_effects(node)
+        # Tag de familia Python para los nodos de muestra "Input", "Process" y "Output"
+        try:
+            if str(title) in ("Input", "Process", "Output"):
+                node._language = "python"
+        except Exception:
+            pass
         try:
             if isinstance(node, VariableNode):
                 node.variable_changed.connect(lambda *_: self.evaluate_graph())

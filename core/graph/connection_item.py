@@ -62,6 +62,8 @@ class ConnectionItem(QGraphicsPathItem):
         # Shimmer: pequeños destellos que se desplazan por el cable
         self._shimmer_offset = 0.0
         self._shimmer_speed = 2.2
+        # Pulso de valor: frames restantes con brillo reforzado
+        self._pulse_frames = 0
 
         self.update_path()
         # Cache en coordenadas de dispositivo para mantener líneas nítidas al zoom
@@ -198,13 +200,18 @@ class ConnectionItem(QGraphicsPathItem):
         neon_color = self._exec_neon_color if kind == "exec" else self._neon_color
         neon_core = self._exec_neon_core if kind == "exec" else self._neon_core
 
+        # Refuerzo temporal de brillo si hubo pulso reciente
+        pulse_boost = 1.0
+        if self._pulse_frames > 0:
+            pulse_boost = 1.35
+
         # Brillo (glow) bajo la línea con flicker sutil
         painter.save()
         flicker = 0.85 + 0.15 * math.sin(self._flicker_phase)  # amplitud baja
         if self._hovered:
             flicker *= 1.15
-        soft_alpha = int(self._glow_alpha_soft * min(flicker, 1.25))
-        strong_alpha = int(self._glow_alpha_strong * min(flicker, 1.25))
+        soft_alpha = int(self._glow_alpha_soft * min(flicker * pulse_boost, 1.6))
+        strong_alpha = int(self._glow_alpha_strong * min(flicker * pulse_boost, 1.6))
         if self._use_gradient:
             brush_soft = self._make_gradient_brush(start_pos, end_pos, soft_alpha)
             brush_strong = self._make_gradient_brush(start_pos, end_pos, strong_alpha)
@@ -273,9 +280,11 @@ class ConnectionItem(QGraphicsPathItem):
         try:
             painter.save()
             pt = path.pointAtPercent(self._anim_t % 1.0)
-            radius = 6.0
+            radius = 6.0 if self._pulse_frames <= 0 else 8.0
             glow_grad = QRadialGradient(pt, radius)
-            glow_col = QColor(neon_color.red(), neon_color.green(), neon_color.blue(), 220)
+            # Aumentar alpha del destello si hay pulso
+            alpha = 220 if self._pulse_frames <= 0 else 255
+            glow_col = QColor(neon_color.red(), neon_color.green(), neon_color.blue(), alpha)
             glow_grad.setColorAt(0.0, glow_col)
             glow_grad.setColorAt(1.0, QColor(neon_color.red(), neon_color.green(), neon_color.blue(), 0))
             painter.setPen(Qt.NoPen)
@@ -299,7 +308,16 @@ class ConnectionItem(QGraphicsPathItem):
         self._shimmer_offset += self._shimmer_speed
         if self._shimmer_offset > 1000.0:
             self._shimmer_offset = 0.0
+        if self._pulse_frames > 0:
+            self._pulse_frames -= 1
         self.update()
+
+    def pulse_on_value(self):
+        """Activa un refuerzo visual breve cuando cambia el valor propagado."""
+        try:
+            self._pulse_frames = 10
+        except Exception:
+            pass
     def _get_port_kind(self, item, port_name: str, port_type: str) -> str:
         """Resuelve el 'kind' del puerto ('exec'|'data') en el item indicado."""
         try:
@@ -338,7 +356,17 @@ class ConnectionItem(QGraphicsPathItem):
             ports = getattr(self.end_item, 'input_ports', []) or []
             for p in ports:
                 if str(p.get('name')) == str(self.end_port):
-                    return bool(p.get('multi', False)) or str(getattr(self.end_item, 'node_type', '')).lower() == 'output'
+                    # Puerto declarado explícitamente como multi
+                    if bool(p.get('multi', False)):
+                        return True
+                    # Si hay más de una conexión actualmente, tratar como multi dinámico
+                    try:
+                        cnt = 0
+                        if hasattr(self.end_item, 'port_connection_count'):
+                            cnt = int(self.end_item.port_connection_count(self.end_port, 'input'))
+                        return cnt > 1
+                    except Exception:
+                        return False
         except Exception:
             pass
         return False
