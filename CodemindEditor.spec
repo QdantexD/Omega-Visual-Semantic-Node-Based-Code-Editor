@@ -32,7 +32,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    version='version-1.0.1.txt',
+    version='version-1.5.0-alpha.txt',
     icon=['assets\\app.ico'],
 )
 coll = COLLECT(
