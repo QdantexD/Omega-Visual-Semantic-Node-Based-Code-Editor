@@ -382,6 +382,16 @@ class NodeView(QGraphicsView):
         """Si la escena está vacía, delega la creación del grafo demo."""
         try:
             build_demo_graph(self)
+            # Asegurar que no queden nodos Output/Group Output del demo anterior
+            try:
+                leftovers = [it for it in self._scene.items() if isinstance(it, NodeItem) and str(getattr(it, 'node_type', '')).lower() in ('output','group_output')]
+            except Exception:
+                leftovers = []
+            for it in leftovers:
+                try:
+                    self.remove_node(it, record_undo=False)
+                except Exception:
+                    pass
         except Exception:
             logger.exception("No se pudo asegurar el grafo demo")
 
@@ -1245,8 +1255,27 @@ class NodeView(QGraphicsView):
                     return
                 except Exception:
                     pass
-            super().keyPressEvent(event)
-            return
+        # Atajo para eliminar nodos Output/Group Output: Ctrl+Shift+Del
+        try:
+            if (event.modifiers() & Qt.ControlModifier) and (event.modifiers() & Qt.ShiftModifier) and event.key() == Qt.Key_Delete:
+                try:
+                    to_remove = [it for it in self._scene.items() if isinstance(it, NodeItem) and str(getattr(it, 'node_type', '')).lower() in ('output','group_output')]
+                except Exception:
+                    to_remove = []
+                for it in to_remove:
+                    try:
+                        self.remove_node(it, record_undo=True)
+                    except Exception:
+                        pass
+                try:
+                    self.evaluate_graph()
+                except Exception:
+                    pass
+                event.accept()
+                return
+        except Exception:
+            pass
+        super().keyPressEvent(event)
         # Alternar minimapa con 'N'
         if event.key() == Qt.Key_N:
             try:
@@ -1426,14 +1455,11 @@ class NodeView(QGraphicsView):
             title="Process", x=pos.x(), y=pos.y(), node_type="process",
             inputs=[{"name": "input", "kind": "data"}], outputs=[{"name": "output", "kind": "data"}], content="input"),
             category="Process", tags=["process"], description="Transforma datos", icon_name="applications-system")
-        add_item("Output", lambda pos: self.add_node_with_ports(
-            title="Output", x=pos.x(), y=pos.y(), node_type="output",
-            inputs=[{"name": "input", "kind": "data"}], outputs=[], content=""),
-            category="IO", tags=["io"], description="Sumidero de datos", icon_name="go-down")
-        add_item("Group Output", lambda pos: self.add_node_with_ports(
-            title="Group Output", x=pos.x(), y=pos.y(), node_type="group_output",
-            inputs=[{"name": "Geometry", "kind": "data"}], outputs=[], content=""),
-            category="IO", tags=["group","io"], description="Salida del grupo (Geometry)", icon_name="go-down")
+        # Nodo Terminal: agrega múltiples entradas y muestra el Total
+        add_item("Terminal", lambda pos: self.add_node_with_ports(
+            title="Terminal", x=pos.x(), y=pos.y(), node_type="terminal",
+            inputs=[{"name": "input", "kind": "data", "multi": True}], outputs=[{"name": "output", "kind": "data"}], content=""),
+            category="IO", tags=["aggregate","total"], description="Nodo Terminal que agrega outputs en Total", icon_name="system-run")
         add_item("Variable", lambda pos: self.add_node_with_ports(
             title="Variable", x=pos.x(), y=pos.y(), node_type="variable",
             inputs=[{"name": "set"}], outputs=[{"name": "output"}], content=""),
@@ -2321,13 +2347,14 @@ class NodeView(QGraphicsView):
                     content=content,
                 )
             elif ntype == "output":
+                # Remapeado: crear nodo Terminal en lugar de Output
                 node = self.add_node_with_ports(
-                    title="Output",
+                    title="Terminal",
                     x=float(scene_pos.x()),
                     y=float(scene_pos.y()),
-                    node_type="output",
+                    node_type="terminal",
                     inputs=[{"name": "input", "kind": "data"}],
-                    outputs=[],
+                    outputs=[{"name": "output", "kind": "data"}],
                     content=content,
                 )
             else:
@@ -2554,6 +2581,31 @@ class NodeView(QGraphicsView):
                     menu.addAction("Mutear nodo")
             except Exception:
                 pass
+        # Acciones específicas para Terminal: abrir terminal externo con perfil
+        if single_selected is not None and str(getattr(single_selected, 'node_type', '')).lower() == 'terminal':
+            try:
+                term_menu = QMenu("Abrir terminal externo", menu)
+                term_menu.addAction("PowerShell")
+                term_menu.addAction("Command Prompt")
+                # Detectar Git Bash
+                try:
+                    import shutil as _sh
+                    if _sh.which("bash") or _sh.which("git-bash") or _sh.which("git.exe"):
+                        term_menu.addAction("Git Bash")
+                except Exception:
+                    pass
+                # Windows Terminal (wt.exe)
+                try:
+                    import shutil as _sh
+                    if _sh.which("wt"):
+                        term_menu.addAction("Windows Terminal")
+                except Exception:
+                    pass
+                menu.addMenu(term_menu)
+                # Acción directa: abrir por defecto (PowerShell)
+                menu.addAction("Abrir en PowerShell externo")
+            except Exception:
+                pass
         # Toggle para reenviar salida desde nodos Output
         if single_selected is not None and str(getattr(single_selected, 'node_type', '')).lower() == 'output':
             try:
@@ -2575,12 +2627,27 @@ class NodeView(QGraphicsView):
         menu.addAction("Crear nodo (genérico)")
         menu.addAction("Crear nodo (Combine)")
         # Nodo especial: Monitor (Output) para reflejar valores en Preview
-        menu.addAction("Crear nodo Monitor (Output)")
-        # Output Global: agrega un Output con múltiples IN y autoconecta fuentes
-        menu.addAction("Crear Output Global (autoconectar)")
+        # Eliminado: acciones para crear nodos Output y Output Global
+        # Terminal: agrega todos los outputs en Total y utilidades de limpieza
+        menu.addAction("Crear nodo Terminal (Total)")
+        menu.addAction("Limpiar Outputs (global)")
+        menu.addAction("Eliminar nodos Output")
         # Utilidades
         menu.addSeparator()
         menu.addAction("Limpiar caché…")
+        # Submenú: perfiles de terminal embebido (solo si hay un nodo Terminal seleccionado)
+        try:
+            node = single_selected
+            if node is not None and str(getattr(node, 'node_type', '')).lower() == 'terminal':
+                menu.addSeparator()
+                term_menu = QMenu("Abrir terminal embebido (perfil)", menu)
+                term_menu.addAction("Abrir terminal embebido (PowerShell)")
+                term_menu.addAction("Abrir terminal embebido (Git Bash)")
+                term_menu.addAction("Abrir terminal embebido (Command Prompt)")
+                menu.addMenu(term_menu)
+                menu.addAction("Cerrar terminal embebido")
+        except Exception:
+            pass
         # Acción contextual: generar nodo de programación C++ desde variable cuando el lenguaje activo es C++
         if is_variable_selected:
             try:
@@ -2746,7 +2813,7 @@ class NodeView(QGraphicsView):
                     except Exception:
                         scene_pos = self.mapToScene(view_pos)
                         cx, cy = scene_pos.x(), scene_pos.y()
-                    node = self.add_node_with_ports(title="Output Combined", x=cx + 40, y=cy + 40, node_type="output", inputs=["input"], outputs=["output"], content=combined)
+                    node = self.add_node_with_ports(title="Terminal Combined", x=cx + 40, y=cy + 40, node_type="terminal", inputs=["input"], outputs=["output"], content=combined)
                     if node is not None:
                         try:
                             setattr(node, 'is_snapshot', True)
@@ -2862,6 +2929,39 @@ class NodeView(QGraphicsView):
                     self.update_all_connections()
                 except Exception:
                     pass
+            elif text == "Abrir en PowerShell externo":
+                try:
+                    # Abrir PowerShell con el directorio actual del proceso
+                    cwd = os.getcwd()
+                    import subprocess, shutil
+                    ps_cmd = shutil.which("powershell") or shutil.which("powershell.exe") or "powershell"
+                    subprocess.Popen([ps_cmd, "-NoExit", "-NoLogo"], cwd=cwd)
+                except Exception:
+                    logger.exception("No se pudo abrir PowerShell externo")
+            elif text in ("Abrir terminal embebido (PowerShell)", "Abrir terminal embebido (Command Prompt)", "Abrir terminal embebido (Git Bash)"):
+                try:
+                    node = single_selected
+                    if node is None or str(getattr(node, 'node_type', '')).lower() != 'terminal':
+                        return
+                    profile_map = {
+                        "Abrir terminal embebido (PowerShell)": "PowerShell",
+                        "Abrir terminal embebido (Command Prompt)": "Command Prompt",
+                        "Abrir terminal embebido (Git Bash)": "Git Bash",
+                    }
+                    profile = profile_map.get(text, "PowerShell")
+                    if hasattr(node, 'open_embedded_terminal'):
+                        node.open_embedded_terminal(profile)
+                except Exception:
+                    logger.exception("No se pudo abrir terminal embebido")
+            elif text == "Cerrar terminal embebido":
+                try:
+                    node = single_selected
+                    if node is None or str(getattr(node, 'node_type', '')).lower() != 'terminal':
+                        return
+                    if hasattr(node, 'close_embedded_terminal'):
+                        node.close_embedded_terminal()
+                except Exception:
+                    logger.exception("No se pudo cerrar terminal embebido")
             elif text == "Crear nodo (genérico)":
                 scene_pos = self.mapToScene(view_pos)
                 node = self.add_node("Node", scene_pos.x(), scene_pos.y(), node_type="generic")
@@ -2874,63 +2974,77 @@ class NodeView(QGraphicsView):
                 if node:
                     node.setSelected(True)
                     self.centerOn(node)
-            elif text == "Crear nodo Monitor (Output)":
+            elif text == "Crear nodo Terminal (Total)":
                 scene_pos = self.mapToScene(view_pos)
-                # Crear un nodo de tipo 'output' con entrada 'input' y salida 'output'
-                mon = self.add_node_with_ports("Monitor", scene_pos.x(), scene_pos.y(), node_type="output", inputs=[{"name": "input", "kind": "data", "multi": True}], outputs=["output"], content="")
-                if mon:
-                    try:
-                        # Activar reenvío de salida para poder encadenarlo si se desea
-                        setattr(mon, 'forward_output', True)
-                    except Exception:
-                        pass
-                    # Si hay un único nodo seleccionado, autoconectar su primer OUT al IN del monitor
-                    try:
-                        selected_nodes_ctx = [it for it in self._scene.selectedItems() if isinstance(it, NodeItem)]
-                        if len(selected_nodes_ctx) == 1:
-                            src = selected_nodes_ctx[0]
-                            start_port = (src.output_ports[0]['name'] if getattr(src, 'output_ports', None) else 'output')
-                            end_port = (mon.input_ports[0]['name'] if getattr(mon, 'input_ports', None) else 'input')
-                            self.add_connection(src, mon, start_port=start_port, end_port=end_port)
-                    except Exception:
-                        pass
-                    # Seleccionar y centrar el monitor para feedback visual
-                    try:
-                        mon.setSelected(True)
-                        self.centerOn(mon)
-                    except Exception:
-                        pass
-            elif text == "Crear Output Global (autoconectar)":
-                scene_pos = self.mapToScene(view_pos)
-                # Fuentes: si hay selección, usarla; si no, usar todos los nodos no-Output
+                # Fuentes: igual que Output Global, pero creando un nodo 'terminal'
                 sources = []
                 try:
                     selected_nodes_ctx = [it for it in self._scene.selectedItems() if isinstance(it, NodeItem)]
                     if selected_nodes_ctx:
-                        sources = [n for n in selected_nodes_ctx if str(getattr(n, 'node_type', '')).lower() != 'output']
+                        sources = [n for n in selected_nodes_ctx if str(getattr(n, 'node_type', '')).lower() not in ('output','group_output')]
                     else:
-                        # Todos los NodeItem de la escena que no sean 'output'
-                        sources = [it for it in self._scene.items() if isinstance(it, NodeItem) and str(getattr(it, 'node_type', '')).lower() != 'output']
+                        sources = [it for it in self._scene.items() if isinstance(it, NodeItem) and str(getattr(it, 'node_type', '')).lower() not in ('output','group_output')]
                 except Exception:
                     sources = []
-                # Crear lista de puertos IN: uno por fuente
                 in_names = [f"in{i+1}" for i in range(len(sources))] or ["input"]
-                out_names = ["output"]
-                out_node = self.add_node_with_ports("Output Global", scene_pos.x(), scene_pos.y(), node_type="output", inputs=in_names, outputs=out_names, content="")
-                if out_node:
-                    # Conectar cada fuente a su puerto IN dedicado
+                term = self.add_node_with_ports("Terminal", scene_pos.x(), scene_pos.y(), node_type="terminal", inputs=in_names, outputs=["output"], content="")
+                if term:
                     for idx, src in enumerate(sources):
                         try:
                             start_port = (src.output_ports[0]['name'] if getattr(src, 'output_ports', None) else 'output')
-                            end_port = (out_node.input_ports[idx]['name'] if idx < len(out_node.input_ports) else 'input')
-                            self.add_connection(src, out_node, start_port=start_port, end_port=end_port)
+                            end_port = (term.input_ports[idx]['name'] if idx < len(term.input_ports) else 'input')
+                            self.add_connection(src, term, start_port=start_port, end_port=end_port)
                         except Exception:
                             pass
                     try:
-                        out_node.setSelected(True)
-                        self.centerOn(out_node)
+                        term.setSelected(True)
+                        self.centerOn(term)
                     except Exception:
                         pass
+                    # Evaluar para reflejar Total inmediatamente
+                    try:
+                        self.evaluate_graph()
+                    except Exception:
+                        pass
+            elif text == "Limpiar Outputs (global)":
+                try:
+                    nodes = [it for it in self._scene.items() if isinstance(it, NodeItem)]
+                except Exception:
+                    nodes = []
+                # Resetear valores de salida y entradas; limpiar contenido en outputs
+                for n in nodes:
+                    try:
+                        n.output_values = {}
+                        n._output_cache = {}
+                        n._last_inputs_hash = None
+                        # Reiniciar inputs para siguiente evaluación
+                        n.input_values = {}
+                        # Limpiar contenido visible de nodos Output/Group Output
+                        if str(getattr(n, 'node_type', '')).lower() in ('output','group_output'):
+                            if hasattr(n, 'update_from_text'):
+                                n.update_from_text("")
+                        n.is_dirty = True
+                    except Exception:
+                        pass
+                # Reevaluar y notificar
+                try:
+                    self.evaluate_graph()
+                except Exception:
+                    pass
+            elif text == "Eliminar nodos Output":
+                try:
+                    to_remove = [it for it in self._scene.items() if isinstance(it, NodeItem) and str(getattr(it, 'node_type', '')).lower() in ('output','group_output')]
+                except Exception:
+                    to_remove = []
+                for it in to_remove:
+                    try:
+                        self.remove_node(it, record_undo=True)
+                    except Exception:
+                        pass
+                try:
+                    self.evaluate_graph()
+                except Exception:
+                    pass
             elif text == "Limpiar caché…":
                 try:
                     self._clear_node_cache()
@@ -3649,7 +3763,12 @@ class NodeView(QGraphicsView):
         # Luego eliminar todos los nodos
         for item in self._scene.items()[:]:
             if isinstance(item, NodeItem):
-                self._scene.removeItem(item)
+                try:
+                    # Evitar errores si el item ya no pertenece a la escena
+                    if item is not None and item.scene() is self._scene:
+                        self._scene.removeItem(item)
+                except Exception:
+                    pass
     
     def remove_node(self, node_item, record_undo: bool = True):
         """Elimina un nodo específico y sus conexiones (con undo opcional)."""
@@ -3704,7 +3823,11 @@ class NodeView(QGraphicsView):
             self.remove_connection(connection, record_undo=False)
         
         # Eliminar el nodo
-        self._scene.removeItem(node_item)
+        try:
+            if node_item is not None and node_item.scene() is self._scene:
+                self._scene.removeItem(node_item)
+        except Exception:
+            pass
 
     def center_on_selected(self):
         selected = self._scene.selectedItems()
@@ -3750,10 +3873,11 @@ class NodeView(QGraphicsView):
             if hasattr(self, '_runtime') and self._runtime:
                 self._runtime.rebuild_from_view()
                 self._runtime.evaluate_all()
-                try:
-                    self.graphEvaluated.emit()
-                except Exception:
-                    pass
+        except Exception:
+            pass
+        # Emitir siempre la señal para refrescar paneles en tiempo real
+        try:
+            self.graphEvaluated.emit()
         except Exception:
             pass
 
@@ -3835,6 +3959,9 @@ class NodeView(QGraphicsView):
             models = project_from_dict(data.get("project", {}))
             for nm in models:
                 try:
+                    # Omitir nodos Output/Group Output al importar para eliminarlos por completo
+                    if str(getattr(nm, 'type', '')).lower() in ('output','group_output'):
+                        continue
                     # inputs/outputs ya vienen como lista de dicts {name, kind}
                     node = self.add_node_with_ports(
                         title=str(nm.title or "Node"),

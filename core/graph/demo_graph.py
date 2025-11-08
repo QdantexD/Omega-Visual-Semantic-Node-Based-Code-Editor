@@ -4,7 +4,7 @@ from PySide6.QtCore import Qt, QPointF, QTimer, QSize
 
 
 def build_demo_graph(view) -> None:
-    """Crea el grafo demo Input->Process->Output y encuadra la vista.
+    """Crea el grafo demo Input->Process->Terminal y encuadra la vista.
 
     Extraído desde NodeView para mantener el archivo principal más limpio.
     """
@@ -21,7 +21,7 @@ def build_demo_graph(view) -> None:
         specs = [
             {"title": "Input", "x": -300, "y": -80, "type": "input", "inputs": [], "outputs": ["output"], "content": "Hola"},
             {"title": "Process", "x": 40, "y": -20, "type": "process", "inputs": ["input"], "outputs": ["output"], "content": "input.upper()"},
-            {"title": "Output", "x": 320, "y": 70, "type": "output", "inputs": ["input"], "outputs": [], "content": ""},
+            {"title": "Terminal", "x": 320, "y": 70, "type": "terminal", "inputs": ["input"], "outputs": ["output"], "content": ""},
         ]
         created = []
         for spec in specs:
@@ -36,7 +36,7 @@ def build_demo_graph(view) -> None:
         try:
             inp = next((n for n in created if getattr(n, 'node_type', '') == 'input'), None)
             proc = next((n for n in created if getattr(n, 'node_type', '') == 'process'), None)
-            out = next((n for n in created if getattr(n, 'node_type', '') == 'output'), None)
+            out = next((n for n in created if getattr(n, 'node_type', '') == 'terminal'), None)
             if inp and proc:
                 view.add_connection(inp, proc, start_port=(inp.output_ports[0]['name'] if inp.output_ports else 'output'), end_port=(proc.input_ports[0]['name'] if proc.input_ports else 'input'), record_undo=False)
             if proc and out:

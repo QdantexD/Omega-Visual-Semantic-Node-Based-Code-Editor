@@ -6,6 +6,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from ..ui.app_icons import make_hat_icon, make_hat_icon_neon, make_top_hat_icon
 from ..ui.text_editor import TextEditor
 from .code_editor_window import CodeEditorWindow
+from .code_map_panel import CodeMapPanel
 from ..graph.node_item import NodeItem
 from .blueprint_editor_window import BlueprintEditorWindow
 from .node_content_editor_window import NodeContentEditorWindow
@@ -206,13 +207,17 @@ class EditorWindow(QtWidgets.QMainWindow):
             btn_code.setStyleSheet("QPushButton{background:#1b2230;color:#cbd5e1;padding:8px;border:1px solid #202a36;border-radius:6px;}QPushButton:hover{background:#1a202a;}")
             btn_dual = QtWidgets.QPushButton("Abrir ambos (nodos izquierda, texto derecha)", self._add_side_panel)
             btn_dual.setStyleSheet("QPushButton{background:#1b2230;color:#cbd5e1;padding:8px;border:1px solid #202a36;border-radius:6px;}QPushButton:hover{background:#1a202a;}")
+            btn_code_map = QtWidgets.QPushButton("Mapa de código (selección)", self._add_side_panel)
+            btn_code_map.setStyleSheet("QPushButton{background:#1b2230;color:#cbd5e1;padding:8px;border:1px solid #202a36;border-radius:6px;}QPushButton:hover{background:#1a202a;}")
             sp_layout.addWidget(btn_clone)
             sp_layout.addWidget(btn_code)
             sp_layout.addWidget(btn_dual)
+            sp_layout.addWidget(btn_code_map)
             sp_layout.addStretch(1)
             btn_clone.clicked.connect(lambda: (self._open_nodes_editor_window_clone(), self._hide_add_panel()))
             btn_code.clicked.connect(lambda: (self._open_code_editor_window(), self._hide_add_panel()))
-            btn_dual.clicked.connect(lambda: (self._open_dual_editors(), self._hide_add_panel()))
+            btn_dual.clicked.connect(lambda: (self._open_dual_dock_layout(), self._hide_add_panel()))
+            btn_code_map.clicked.connect(lambda: (self._open_code_map_dock_layout(), self._hide_add_panel()))
 
             # Overlay para cerrar al click
             self._panel_overlay = QtWidgets.QFrame(self)
@@ -258,6 +263,12 @@ class EditorWindow(QtWidgets.QMainWindow):
 
         # Restaurar estado del sidebar
         self._restore_sidebar_state()
+
+        # Intentar restaurar el estado de docks (interfaz acoplable)
+        try:
+            self._restore_window_state()
+        except Exception:
+            pass
 
         # Asegurar que el Explorer esté listo al inicio
         QtCore.QTimer.singleShot(0, self._ensure_explorer_ready)
@@ -623,6 +634,10 @@ class EditorWindow(QtWidgets.QMainWindow):
     # -----------------------------
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:  # noqa: N802
         self._save_sidebar_state()
+        try:
+            self._save_window_state()
+        except Exception:
+            pass
         super().closeEvent(event)
 
     # -----------------------------
@@ -805,8 +820,104 @@ class EditorWindow(QtWidgets.QMainWindow):
                 w_code.setGeometry(right_rect)
             except Exception:
                 base = self.frameGeometry()
-                w_nodes.move(base.topLeft() + QtCore.QPoint(10, 10))
-                w_code.move(base.topLeft() + QtCore.QPoint(40 + w_nodes.width(), 10))
+                try:
+                    w_nodes.move(base.topLeft() + QtCore.QPoint(10, 10))
+                    w_code.move(base.topLeft() + QtCore.QPoint(40 + w_nodes.width(), 10))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _open_dual_dock_layout(self) -> None:
+        """Activa una interfaz acoplable: Nodos al centro y editor de código en un dock.
+
+        - El dock puede moverse a la derecha o abajo y flotar (estilo UE5).
+        - El estado se guarda/restaura con QSettings.
+        """
+        try:
+            # Si ya existe, mostrar/activar
+            if hasattr(self, 'code_dock') and getattr(self, 'code_dock') is not None:
+                try:
+                    self.code_dock.show()
+                    self.code_dock.raise_()
+                    self.statusBar().showMessage("Panel de código acoplable activo", 1500)
+                    return
+                except Exception:
+                    pass
+
+            dock = QtWidgets.QDockWidget("Editor de código", self)
+            dock.setObjectName("CodeDock")
+            dock.setAllowedAreas(QtCore.Qt.RightDockWidgetArea | QtCore.Qt.BottomDockWidgetArea)
+            dock.setFeatures(QtWidgets.QDockWidget.DockWidgetClosable | QtWidgets.QDockWidget.DockWidgetMovable | QtWidgets.QDockWidget.DockWidgetFloatable)
+            # Editor reutilizable
+            editor = TextEditor()
+            try:
+                from ..ui.text_editor import PythonHighlighter
+                PythonHighlighter(editor.document())
+            except Exception:
+                pass
+            dock.setWidget(editor)
+            self.addDockWidget(QtCore.Qt.RightDockWidgetArea, dock)
+            try:
+                dock.setMinimumWidth(360)
+            except Exception:
+                pass
+            self.code_dock = dock
+            # Estilo coherente
+            try:
+                dock.setStyleSheet("QDockWidget{color:#cbd5e1;background:#0f1318;border:1px solid #202a36;} QDockWidget::title{padding-left:6px;background:#141923;}")
+            except Exception:
+                pass
+            self.statusBar().showMessage("Interfaz acoplable estilo UE habilitada", 1600)
+        except Exception:
+            pass
+
+    def _open_code_map_dock_layout(self) -> None:
+        """Crea/activa el dock 'Mapa de código' que refleja la selección en tiempo real."""
+        try:
+            if hasattr(self, 'code_map_dock') and getattr(self, 'code_map_dock') is not None:
+                try:
+                    self.code_map_dock.show()
+                    self.code_map_dock.raise_()
+                    self.statusBar().showMessage("Mapa de código activo", 1500)
+                    return
+                except Exception:
+                    pass
+            dock = QtWidgets.QDockWidget("Mapa de código", self)
+            dock.setObjectName("CodeMapDock")
+            dock.setAllowedAreas(QtCore.Qt.RightDockWidgetArea | QtCore.Qt.BottomDockWidgetArea)
+            dock.setFeatures(QtWidgets.QDockWidget.DockWidgetClosable | QtWidgets.QDockWidget.DockWidgetMovable | QtWidgets.QDockWidget.DockWidgetFloatable)
+            panel = CodeMapPanel(self.node_view, parent=dock)
+            dock.setWidget(panel)
+            self.addDockWidget(QtCore.Qt.RightDockWidgetArea, dock)
+            try:
+                dock.setMinimumWidth(340)
+            except Exception:
+                pass
+            try:
+                dock.setStyleSheet("QDockWidget{color:#cbd5e1;background:#0f1318;border:1px solid #202a36;} QDockWidget::title{padding-left:6px;background:#141923;}")
+            except Exception:
+                pass
+            self.code_map_dock = dock
+            self.statusBar().showMessage("Dock 'Mapa de código' creado", 1600)
+        except Exception:
+            pass
+
+    def _restore_window_state(self) -> None:
+        """Restaura el estado de docks si fue guardado."""
+        try:
+            ba = self._settings.value("mw_state")
+            if isinstance(ba, QtCore.QByteArray):
+                self.restoreState(ba)
+        except Exception:
+            pass
+
+    def _save_window_state(self) -> None:
+        """Guarda el estado actual de los docks."""
+        try:
+            self._settings.setValue("mw_state", self.saveState())
+        except Exception:
+            pass
 
             # Mantener referencias
             self._child_windows.append(w_nodes)

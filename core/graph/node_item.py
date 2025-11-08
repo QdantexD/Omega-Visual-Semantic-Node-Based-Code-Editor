@@ -1,10 +1,10 @@
 from PySide6.QtWidgets import (
     QApplication, QGraphicsRectItem, QGraphicsTextItem, QGraphicsView, QGraphicsScene, QGraphicsItem,
-    QPlainTextEdit, QWidget, QGraphicsProxyWidget, QGraphicsDropShadowEffect, QPushButton
+    QPlainTextEdit, QWidget, QGraphicsProxyWidget, QGraphicsDropShadowEffect, QPushButton, QLineEdit, QVBoxLayout
 )
-from PySide6.QtCore import QRectF, Qt, QPointF, QSize, QTimer
+from PySide6.QtCore import QRectF, Qt, QPointF, QSize, QTimer, QProcess
 from PySide6.QtGui import QBrush, QColor, QPen, QFont, QPainter, QPainterPath, QLinearGradient, QPainterPathStroker
-import sys, io, traceback, ast
+import sys, io, traceback, ast, os
 
 GRID_SIZE = 20  # Snap al grid
 
@@ -24,6 +24,7 @@ class CodeEditor(QPlainTextEdit):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._host_node = None  # Se establece desde NodeItem
+        self.placeholder_text = ""  # Texto fantasma cuando el documento está vacío
         # Flag anti-reentrancia para el pintado de números de línea
         self._painting_line_numbers = False
         self.lineNumberArea = LineNumberArea(self)
@@ -45,6 +46,36 @@ class CodeEditor(QPlainTextEdit):
             # Eliminar marco del QFrame base para evitar cuadros visibles
             from PySide6.QtWidgets import QFrame
             self.setFrameStyle(QFrame.NoFrame)
+        except Exception:
+            pass
+
+    def setPlaceholderText(self, text: str):
+        try:
+            self.placeholder_text = str(text or "")
+            # Forzar repintado para reflejar cambios de placeholder
+            self.viewport().update()
+        except Exception:
+            pass
+
+    def paintEvent(self, event):
+        # Pintado normal
+        super().paintEvent(event)
+        # Dibujar placeholder si no hay contenido
+        try:
+            if (self.toPlainText() or "").strip() == "" and (self.placeholder_text or "").strip() != "":
+                p = QPainter(self.viewport())
+                try:
+                    # Color suave y monoespaciado para estilo terminal
+                    p.setPen(QColor("#94a3b8"))  # slate-400
+                    p.setFont(QFont("Consolas", 11))
+                    x = self.lineNumberAreaWidth() + 8
+                    y = self.fontMetrics().ascent() + 8
+                    p.drawText(x, y, self.placeholder_text)
+                finally:
+                    try:
+                        p.end()
+                    except Exception:
+                        pass
         except Exception:
             pass
 
@@ -112,6 +143,130 @@ class CodeEditor(QPlainTextEdit):
             except Exception:
                 pass
         super().keyPressEvent(event)
+
+
+class EmbeddedTerminal(QWidget):
+    """Terminal embebido básico basado en QProcess.
+
+    - Soporta perfiles: PowerShell, CMD y Git Bash.
+    - Muestra la salida en tiempo real y envía líneas al STDIN.
+    - No modifica el contenido del nodo por sí mismo; el host decide.
+    """
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self._process = QProcess(self)
+        self._running = False
+        self._profile = "PowerShell"
+        self._cwd = os.getcwd()
+
+        # UI mínima: salida y línea de entrada
+        self.output = QPlainTextEdit(self)
+        self.output.setReadOnly(True)
+        try:
+            self.output.setFont(QFont("Consolas", 10))
+        except Exception:
+            self.output.setFont(QFont("Courier New", 10))
+        self.input = QLineEdit(self)
+        self.input.setPlaceholderText("Escribe un comando y pulsa Enter…")
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(4, 4, 4, 4)
+        lay.setSpacing(4)
+        lay.addWidget(self.output)
+        lay.addWidget(self.input)
+
+        # Señales de proceso
+        self._process.setProcessChannelMode(QProcess.MergedChannels)
+        self._process.readyReadStandardOutput.connect(self._on_ready_output)
+        self._process.finished.connect(self._on_finished)
+        self.input.returnPressed.connect(self._send_line)
+
+    def _on_ready_output(self):
+        try:
+            data = bytes(self._process.readAllStandardOutput()).decode('utf-8', errors='replace')
+            if data:
+                self.output.appendPlainText(data.rstrip("\n"))
+        except Exception:
+            pass
+
+    def _on_finished(self):
+        self._running = False
+        try:
+            self.output.appendPlainText("[Proceso terminado]")
+        except Exception:
+            pass
+
+    def _send_line(self):
+        text = self.input.text()
+        if not text:
+            return
+        try:
+            # Eco ligero para que el usuario vea lo enviado
+            self.output.appendPlainText(f"> {text}")
+        except Exception:
+            pass
+        try:
+            self._process.write((text + "\n").encode('utf-8', errors='ignore'))
+        except Exception:
+            pass
+        self.input.clear()
+
+    def start(self, profile: str = "PowerShell", cwd: str | None = None):
+        self._profile = profile or "PowerShell"
+        if cwd:
+            self._cwd = cwd
+        # Determinar comando y argumentos por perfil
+        exe = None
+        args: list[str] = []
+        import shutil
+        low = str(self._profile).lower()
+        if "git" in low or "bash" in low:
+            exe = shutil.which("bash") or shutil.which("bash.exe")
+            if not exe:
+                # Fallback a instalación típica de Git Bash
+                guess = r"C:\\Program Files\\Git\\bin\\bash.exe"
+                exe = guess if os.path.exists(guess) else "bash"
+            args = ["--login", "-i"]
+        elif "cmd" in low or "command" in low:
+            exe = shutil.which("cmd") or shutil.which("cmd.exe") or "cmd.exe"
+            args = ["/K"]
+        else:
+            # PowerShell por defecto: intentar pwsh y luego powershell.exe
+            exe = shutil.which("pwsh") or shutil.which("pwsh.exe")
+            if not exe:
+                exe = shutil.which("powershell") or shutil.which("powershell.exe") or "powershell.exe"
+            args = ["-NoLogo", "-NoExit"]
+        try:
+            if self._running:
+                self.stop()
+            self.output.clear()
+            self._process.setWorkingDirectory(self._cwd)
+            self._process.start(exe, args)
+            self._running = True
+            # Mostrar prompt inicial si procede
+            if "powershell" in exe.lower() or (args and "-NoExit" in args):
+                self.output.appendPlainText(f"PS {self._cwd}>")
+        except Exception:
+            self.output.appendPlainText("[No se pudo iniciar el terminal]")
+            self._running = False
+
+    def stop(self):
+        try:
+            if self._process and self._running:
+                self._process.kill()
+        except Exception:
+            pass
+        self._running = False
+
+    def is_running(self) -> bool:
+        return bool(self._running)
+
+    def buffer_text(self) -> str:
+        try:
+            return self.output.toPlainText() or ""
+        except Exception:
+            return ""
 
 class NodeItem(QGraphicsRectItem):
     """Nodo estilo Houdini/Nuke: movimiento estable, snap al grid, selección múltiple y hover."""
@@ -218,6 +373,20 @@ class NodeItem(QGraphicsRectItem):
         self._border_color = QColor("#3a3f4b")          # borde normal
         self._selected_border_color = QColor("#f59e0b") # borde seleccionado (ámbar)
         self._title_bg_color = QColor("#1b1e24")        # barra de título
+        # Ajuste específico para nodos 'terminal' con look tipo PowerShell
+        self._is_terminal_ps = (str(self.node_type).lower() == "terminal")
+        if self._is_terminal_ps:
+            # Azules profundos similares al fondo de PowerShell clásico
+            self._bg_color = QColor("#0b1733")
+            self._title_bg_color = QColor("#0a1630")
+            # Texto del contenido más claro para mayor contraste en fondo azul
+            self._terminal_text_color = QColor("#e5e7eb")
+            # Para un look más limpio: no mostrar texto dentro del nodo cuando no está en edición
+            # (solo conservar el título). Esto desactiva el overlay visual del prompt.
+            self._show_terminal_prompt = False
+        else:
+            self._terminal_text_color = QColor("#d1d5db")
+            self._show_terminal_prompt = False
         self._title_text_color = QColor("#e6e8ea")      # texto de título
         # Diagnóstico: última escala de vista observada
         self._debug_last_view_scale = None
@@ -258,7 +427,8 @@ class NodeItem(QGraphicsRectItem):
         # Contenido visible bajo el título (editable)
         self.content_item = QGraphicsTextItem(self)
         self.content_item.setPlainText(self.content)
-        self.content_item.setDefaultTextColor(QColor("#d1d5db"))
+        # Color de texto según tipo (PowerShell usa alto contraste)
+        self.content_item.setDefaultTextColor(self._terminal_text_color)
         # Fuente monoespaciada amigable para Windows; fallback si no existe
         try:
             mono = QFont("Consolas", 10)
@@ -326,6 +496,19 @@ class NodeItem(QGraphicsRectItem):
         self.debug_item.setFont(mono_dbg)
         self.debug_item.setDefaultTextColor(QColor("#93c5fd"))  # azul claro para logs
         self.debug_item.setTextInteractionFlags(Qt.NoTextInteraction)
+
+        # Terminal embebido (solo para nodos tipo 'terminal')
+        self._terminal_profile = "PowerShell"
+        if self._is_terminal_ps:
+            try:
+                self.terminal_widget = EmbeddedTerminal()
+                self.terminal_widget_proxy = QGraphicsProxyWidget(self)
+                self.terminal_widget_proxy.setWidget(self.terminal_widget)
+                self.terminal_widget_proxy.setVisible(False)
+                self.terminal_widget_proxy.setZValue(11)
+            except Exception:
+                self.terminal_widget = None
+                self.terminal_widget_proxy = None
         self.debug_item.setFlag(QGraphicsItem.ItemIsFocusable, False)
         try:
             self.debug_item.setFlag(QGraphicsItem.ItemIgnoresTransformations, True)
@@ -393,9 +576,16 @@ class NodeItem(QGraphicsRectItem):
             max_ports = 0
         ports_block_h_actual = 12.0 + max(0, max_ports - 1) * gap + (22.0 if max_ports > 0 else 0.0)
         content_top_y = self.title_h + max(padding_t, max(header_h, ports_block_h_actual))
-        self.content_item.setPos(padding_l, content_top_y)
+        # Dejar espacio visual para el prompt en Terminal cuando no está en edición
+        overlay_off = 0.0
+        try:
+            if getattr(self, "_is_terminal_ps", False) and not getattr(self, "_editing", False):
+                overlay_off = 20.0
+        except Exception:
+            overlay_off = 0.0
+        self.content_item.setPos(padding_l, content_top_y + overlay_off)
         content_w = max(10.0, rect.width() - (padding_l + padding_r))
-        content_h = max(10.0, rect.height() - (content_top_y - 0.0) - (padding_b))
+        content_h = max(10.0, rect.height() - (content_top_y - 0.0) - (padding_b) - overlay_off)
         try:
             self.content_item.setTextWidth(content_w)
         except Exception:
@@ -403,7 +593,16 @@ class NodeItem(QGraphicsRectItem):
         # Posicionar el editor clásico cuando esté visible
         try:
             self.content_editor_proxy.setPos(padding_l, content_top_y)
-            self.content_editor.setFixedSize(int(content_w), int(content_h))
+            # El editor no necesita overlay; usa toda el área disponible.
+            self.content_editor.setFixedSize(int(content_w), int(rect.height() - (content_top_y - 0.0) - (padding_b)))
+        except Exception:
+            pass
+        # Posicionar el terminal embebido si existe
+        try:
+            if getattr(self, 'terminal_widget_proxy', None):
+                self.terminal_widget_proxy.setPos(padding_l, content_top_y)
+                if getattr(self, 'terminal_widget', None):
+                    self.terminal_widget.setFixedSize(int(content_w), int(rect.height() - (content_top_y - 0.0) - (padding_b)))
         except Exception:
             pass
         # Botón de salir eliminado: no hay posicionamiento
@@ -453,7 +652,18 @@ class NodeItem(QGraphicsRectItem):
                     doc_h = float(self.content_item.boundingRect().height())
                 except Exception:
                     doc_h = 0.0
-            desired_h = content_top_y + padding_b + max(24.0, doc_h) + 6.0
+            # Compensar espacio del prompt visual en Terminal (si estuviera habilitado)
+            overlay_off = 0.0
+            try:
+                if (
+                    getattr(self, "_is_terminal_ps", False)
+                    and not getattr(self, "_editing", False)
+                    and getattr(self, "_show_terminal_prompt", False)
+                ):
+                    overlay_off = 20.0
+            except Exception:
+                overlay_off = 0.0
+            desired_h = content_top_y + padding_b + max(24.0, doc_h + overlay_off) + 6.0
             # Limitar crecimiento para evitar nodos gigantes accidentales
             max_h = max(self._min_h * 5.0, 600.0)
             new_h = min(max(desired_h, float(self._min_h)), max_h)
@@ -729,24 +939,45 @@ class NodeItem(QGraphicsRectItem):
                 # Alineamos el borde a 0.5px para evitar desenfoque por antialias
                 card_outer = content_rect.adjusted(0.5, 0.5, -0.5, -0.5)
                 grad_card = QLinearGradient(card_outer.topLeft(), card_outer.bottomLeft())
-                grad_card.setColorAt(0.0, QColor(21, 29, 45, 200))
-                grad_card.setColorAt(1.0, QColor(15, 22, 35, 200))
-                pen_card = QPen(QColor(58, 73, 90, 170), 1)
+                # Estilo del área de contenido: si es Terminal, usar look PowerShell
+                if self._is_terminal_ps:
+                    # Azules profundos con borde tenue inspirado en PowerShell
+                    grad_card.setColorAt(0.0, QColor(18, 38, 82, 215))   # top
+                    grad_card.setColorAt(1.0, QColor(9, 24, 51, 215))    # bottom
+                    pen_card = QPen(QColor(72, 99, 150, 180), 1)
+                else:
+                    grad_card.setColorAt(0.0, QColor(21, 29, 45, 200))
+                    grad_card.setColorAt(1.0, QColor(15, 22, 35, 200))
+                    pen_card = QPen(QColor(58, 73, 90, 170), 1)
                 pen_card.setJoinStyle(Qt.RoundJoin)
                 painter.setPen(pen_card)
                 painter.setBrush(QBrush(grad_card))
                 painter.drawRoundedRect(card_outer, 9, 9)
                 # Trazo interno para efecto de "inner shadow" muy leve
                 inner = content_rect.adjusted(1.5, 1.5, -1.5, -1.5)
-                inner_pen = QPen(QColor(25, 33, 50, 120), 1)
+                inner_pen_color = QColor(25, 33, 50, 120) if not self._is_terminal_ps else QColor(20, 32, 64, 140)
+                inner_pen = QPen(inner_pen_color, 1)
                 inner_pen.setJoinStyle(Qt.RoundJoin)
                 painter.setPen(inner_pen)
                 painter.setBrush(Qt.NoBrush)
                 painter.drawRoundedRect(inner, 8, 8)
                 # Línea de brillo superior muy tenue
-                painter.setPen(QPen(QColor(180, 190, 200, 24), 1))
+                top_glow = QColor(180, 190, 200, 24) if not self._is_terminal_ps else QColor(200, 220, 255, 26)
+                painter.setPen(QPen(top_glow, 1))
                 painter.drawLine(card_outer.topLeft() + QPointF(2, 1), card_outer.topRight() + QPointF(-2, 1))
-                # El texto se dibuja con content_item (nítido, sin escalado). No duplicar aquí.
+                # Overlay del prompt tipo PowerShell: desactivado para mantener el nodo limpio (solo título).
+                if self._is_terminal_ps and not getattr(self, '_editing', False) and getattr(self, '_show_terminal_prompt', False):
+                    try:
+                        cwd = os.getcwd()
+                        prompt = f"PS {cwd}>"
+                        # Color y tipografía legibles sobre el fondo azul
+                        painter.setPen(QPen(QColor(220, 230, 245, 215), 1))
+                        painter.setFont(QFont("Consolas", 10))
+                        # Posicionar en el área de contenido con un pequeño margen
+                        prompt_pos = content_rect.topLeft() + QPointF(12, 18)
+                        painter.drawText(prompt_pos, prompt)
+                    except Exception:
+                        pass
         except Exception:
             pass
 
@@ -1084,9 +1315,13 @@ class NodeItem(QGraphicsRectItem):
 
     def update_from_text(self, text):
         """Actualiza el contenido del nodo desde texto plano."""
-        self.content = text.strip()
+        raw = ("" if text is None else str(text))
+        self.content = raw.strip()
+        # Para nodos Terminal: el prompt se dibuja como overlay visual en paint().
+        # No inyectamos el prompt dentro del texto para evitar duplicados y confusión en el editor.
+        display_text = self.content
         try:
-            self.content_item.setPlainText(self.content)
+            self.content_item.setPlainText(display_text)
             self._update_content_layout()
             # Autoajuste a contenido cuando no está en edición
             if not getattr(self, '_editing', False):
@@ -1107,12 +1342,31 @@ class NodeItem(QGraphicsRectItem):
                     self.content_item.clearFocus()
                 except Exception:
                     pass
-                # Mostrar editor clásico y ocultar el texto plano
+                # Editor/Terminal: si es nodo terminal, mostrar el terminal embebido; si no, editor clásico
                 self.content_item.setVisible(False)
-                self.content_editor_proxy.setVisible(True)
-                self.content_editor.setReadOnly(False)
-                self.content_editor.setPlainText(self.content or "")
-                self.content_editor.setFocus()
+                if getattr(self, "_is_terminal_ps", False) and getattr(self, 'terminal_widget_proxy', None):
+                    self.content_editor_proxy.setVisible(False)
+                    self.terminal_widget_proxy.setVisible(True)
+                    # Arrancar proceso si no estaba corriendo
+                    try:
+                        if self.terminal_widget and not self.terminal_widget.is_running():
+                            self.terminal_widget.start(profile=getattr(self, "_terminal_profile", "PowerShell"), cwd=os.getcwd())
+                    except Exception:
+                        pass
+                    try:
+                        self.terminal_widget.setFocus()
+                    except Exception:
+                        pass
+                else:
+                    self.content_editor_proxy.setVisible(True)
+                    self.content_editor.setReadOnly(False)
+                    self.content_editor.setPlainText(self.content or "")
+                    # Placeholder cuando el contenido está vacío
+                    try:
+                        self.content_editor.setPlaceholderText("")
+                    except Exception:
+                        pass
+                    self.content_editor.setFocus()
                 # Mantener título con estilo comentario también en edición
                 self._refresh_title_text()
                 # Cambiar tamaño y elevar Z
@@ -1131,27 +1385,56 @@ class NodeItem(QGraphicsRectItem):
                 # Deshabilitar edición y sincronizar valores al modelo
                 self.title_item.setTextInteractionFlags(Qt.NoTextInteraction)
                 self.title_item.clearFocus()
-                self.content_editor.setReadOnly(True)
-                # Commit del contenido desde el editor clásico
+                # Ocultar editor/terminal y hacer commit del contenido
                 try:
-                    # Solo tomar el texto del editor si el proxy estaba visible (edición real)
-                    if self.content_editor_proxy.isVisible():
-                        self.content = (self.content_editor.toPlainText() or "").strip()
+                    self.content_editor.setReadOnly(True)
                 except Exception:
                     pass
-                # Ocultar editor y mostrar contenido plano
+                # Si estaba el terminal visible, parar proceso y volcar buffer al contenido
+                if getattr(self, "_is_terminal_ps", False) and getattr(self, 'terminal_widget_proxy', None) and self.terminal_widget_proxy.isVisible():
+                    try:
+                        buf = ""
+                        if self.terminal_widget:
+                            buf = self.terminal_widget.buffer_text()
+                            self.terminal_widget.stop()
+                        self.content = (buf or "").strip()
+                    except Exception:
+                        pass
+                    try:
+                        self.terminal_widget_proxy.setVisible(False)
+                    except Exception:
+                        pass
+                else:
+                    # Commit del contenido desde el editor clásico
+                    try:
+                        if self.content_editor_proxy.isVisible():
+                            self.content = (self.content_editor.toPlainText() or "").strip()
+                    except Exception:
+                        pass
+                # Limpiar y ocultar editor clásico
+                try:
+                    self.content_editor.setPlaceholderText("")
+                except Exception:
+                    pass
                 self.content_editor_proxy.setVisible(False)
                 try:
-                    # Asegurar que el proxy quede dentro del rect y sin foco
                     self.content_editor.clearFocus()
                     self.content_editor_proxy.setPos(0, 0)
                     self.content_editor.setFixedSize(1, 1)
                 except Exception:
                     pass
-                # Mantener el contenido plano oculto (renderizado en paint)
-                # Mostrar contenido con QGraphicsTextItem para nitidez y clipping
-                self.content_item.setVisible(True)
-                self.content_item.setPlainText(self.content)
+                # Mostrar/ocultar contenido plano tras salir de edición
+                # Para nodos Terminal queremos un look limpio: sin texto interno.
+                if getattr(self, "_is_terminal_ps", False):
+                    self.content_item.setVisible(False)
+                    try:
+                        self.content_item.setPlainText("")
+                    except Exception:
+                        pass
+                else:
+                    # Otros nodos sí muestran vista previa de texto
+                    self.content_item.setVisible(True)
+                    self.content_item.setPlainText(self.content)
                 try:
                     # Evitar que el texto plano tome foco al salir de edición
                     self.content_item.clearFocus()
@@ -1182,6 +1465,31 @@ class NodeItem(QGraphicsRectItem):
         except Exception:
             pass
         self.update()
+
+    # Control directo desde menú para abrir/cerrar terminal embebido
+    def open_embedded_terminal(self, profile: str = "PowerShell") -> None:
+        if not getattr(self, "_is_terminal_ps", False):
+            return
+        try:
+            self._terminal_profile = profile or "PowerShell"
+        except Exception:
+            pass
+        try:
+            self.set_editing(True)
+        except Exception:
+            pass
+
+    def close_embedded_terminal(self) -> None:
+        if getattr(self, "_is_terminal_ps", False) and getattr(self, 'terminal_widget', None):
+            try:
+                self.terminal_widget.stop()
+            except Exception:
+                pass
+            try:
+                if getattr(self, 'terminal_widget_proxy', None):
+                    self.terminal_widget_proxy.setVisible(False)
+            except Exception:
+                pass
 
     # ----------------------
     # Redimensionamiento por arrastre (como imagen en Word)
@@ -1807,6 +2115,45 @@ class NodeItem(QGraphicsRectItem):
             if own:
                 parts.append(str(own))
             combined = "\n".join(parts)
+            if self.output_ports:
+                out_name = self.output_ports[0]['name']
+                result[out_name] = combined
+            else:
+                result['output'] = combined
+            try:
+                if self.purity_hint == "pure":
+                    self._output_cache = dict(result)
+                    self._last_inputs_hash = self._inputs_signature()
+                self.is_dirty = False
+            except Exception:
+                pass
+            return result
+
+        if node_type == 'terminal':
+            # Agrega todos los valores entrantes y los refleja como 'Total'.
+            parts = []
+            try:
+                for p in (self.input_ports or []):
+                    name = p.get('name', 'input')
+                    v = (self.input_values or {}).get(name, None)
+                    if v is None:
+                        continue
+                    if isinstance(v, list):
+                        for sv in v:
+                            if sv is not None:
+                                parts.append(str(sv))
+                    else:
+                        parts.append(str(v))
+            except Exception:
+                pass
+            combined = "\n".join(parts)
+            # Reflejar en contenido visible para que el usuario vea el Total
+            try:
+                if hasattr(self, 'update_from_text'):
+                    self.update_from_text(combined)
+            except Exception:
+                pass
+            # Publicar también por salida para encadenar si es necesario
             if self.output_ports:
                 out_name = self.output_ports[0]['name']
                 result[out_name] = combined
