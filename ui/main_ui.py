@@ -3,6 +3,10 @@ import asyncio
 import websockets
 from dearpygui import dearpygui as dpg
 
+from .windows.toolbar import build_toolbar
+from .windows.main_window import build_main_window
+from .windows.properties_panel import build_properties_panel
+
 WS_URL = "ws://127.0.0.1:8000/ws"
 
 
@@ -12,13 +16,19 @@ def _set_text(item, value):
 
 def start_ui():
     dpg.create_context()
-    dpg.create_viewport(title="Realtime App", width=400, height=300)
+    dpg.create_viewport(title="Omega-Visual", width=1200, height=800)
     dpg.setup_dearpygui()
 
-    with dpg.window(label="Realtime App", width=380, height=280):
-        ws_label = dpg.add_text("Connecting...")
-        log_label = dpg.add_text("Waiting for messages...")
+    # Build windows
+    toolbar_id = build_toolbar()
+    main_win_id, editor_id = build_main_window()
+    props_id = build_properties_panel()
 
+    # Status labels from toolbar: use alias directly
+    ws_label = "ws_status"
+    log_label = dpg.add_text("Waiting for messages...", parent=toolbar_id)
+
+    # Start WebSocket client thread
     threading.Thread(target=_start_ws_client, args=(ws_label, log_label), daemon=True).start()
 
     dpg.show_viewport()
