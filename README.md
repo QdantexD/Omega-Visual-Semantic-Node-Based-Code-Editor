@@ -1,4 +1,4 @@
-# Codemind Visual — Semantic Node‑Based Code Editor
+# Omega-Visual — Semantic Node‑Based Code Editor
 
 Codemind Visual is a Python‑powered visual development environment where you structure and automate code through intelligent semantic nodes. Each node represents a code block, logical construct, or a predefined library (e.g., C++ variables, Python functions, custom modules) so you can build complex projects visually, organized, and at scale.
 
