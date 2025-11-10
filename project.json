@@ -1,0 +1,23 @@
+{
+  "nodes": [
+    {
+      "id": "node1",
+      "type": "Compute",
+      "title": "Compute",
+      "inputs": [
+        "in"
+      ],
+      "outputs": [
+        "out"
+      ],
+      "meta": {
+        "color": "#66CCFF",
+        "pos": [
+          445,
+          156
+        ]
+      }
+    }
+  ],
+  "links": []
+}
