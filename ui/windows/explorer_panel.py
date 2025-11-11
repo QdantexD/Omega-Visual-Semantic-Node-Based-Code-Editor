@@ -86,13 +86,15 @@ def build_explorer_panel() -> int:
         with dpg.child_window(tag=EXPLORER_TREE_TAG, border=False):
             pass
 
-    # Theme for slightly darker background and light text
+    # Theme: negro elegante con acento verde
     try:
         with dpg.theme() as _outliner_theme:
             with dpg.theme_component(dpg.mvAll):
-                dpg.add_theme_color(dpg.mvThemeCol_WindowBg, (32, 32, 32, 255))  # #202020
-                dpg.add_theme_color(dpg.mvThemeCol_Text, (230, 230, 230, 255))   # #E6E6E6
-                dpg.add_theme_style(dpg.mvStyleVar_WindowRounding, 2.0)
+                dpg.add_theme_color(dpg.mvThemeCol_WindowBg, (20, 20, 20, 255))
+                dpg.add_theme_color(dpg.mvThemeCol_Text, (230, 230, 230, 255))
+                dpg.add_theme_color(dpg.mvThemeCol_Border, (57, 255, 20, 180))
+                dpg.add_theme_color(dpg.mvThemeCol_HeaderHovered, (57, 255, 20, 180))
+                dpg.add_theme_style(dpg.mvStyleVar_WindowRounding, 4.0)
                 dpg.add_theme_style(dpg.mvStyleVar_ItemSpacing, 8.0, 8.0)
         dpg.bind_item_theme(win_id, _outliner_theme)
     except Exception:
@@ -104,3 +106,32 @@ def build_explorer_panel() -> int:
     except Exception:
         pass
     return win_id
+
+
+def build_explorer_sidebar(parent_id: int) -> int:
+    """Construye el contenido del Explorer dentro de la barra lateral (parent window).
+    Devuelve el id del contenedor del árbol para futuras operaciones.
+    """
+    dpg.add_text("Explorer", parent=parent_id)
+    dpg.add_separator(parent=parent_id)
+    with dpg.child_window(tag=EXPLORER_TREE_TAG, border=False) as tree_id:
+        pass
+
+    # Aplicar el mismo tema al parent para coherencia visual
+    try:
+        with dpg.theme() as _outliner_theme:
+            with dpg.theme_component(dpg.mvAll):
+                dpg.add_theme_color(dpg.mvThemeCol_WindowBg, (20, 20, 20, 255))
+                dpg.add_theme_color(dpg.mvThemeCol_Text, (230, 230, 230, 255))
+                dpg.add_theme_color(dpg.mvThemeCol_Border, (57, 255, 20, 160))
+                dpg.add_theme_style(dpg.mvStyleVar_WindowRounding, 4.0)
+                dpg.add_theme_style(dpg.mvStyleVar_ItemSpacing, 8.0, 8.0)
+        dpg.bind_item_theme(parent_id, _outliner_theme)
+    except Exception:
+        pass
+
+    try:
+        _populate_explorer(os.getcwd())
+    except Exception:
+        pass
+    return tree_id

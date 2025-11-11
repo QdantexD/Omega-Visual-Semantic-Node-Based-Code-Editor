@@ -16,3 +16,13 @@ def build_main_window() -> tuple[int, int]:
             # Editor de nodos
             editor_id = dpg.add_node_editor(tag="node_editor")
     return win_id, editor_id
+
+
+def build_main_child(parent_id: int) -> tuple[int, int]:
+    """Construye el editor dentro de un child_window para integrarlo en el dockspace principal."""
+    with dpg.child_window(border=False) as child_id:
+        with dpg.tab_bar(tag="editor_tabbar"):
+            with dpg.tab(label="Editor"):
+                dpg.add_text("🖥️ Viewport Central - Simulación")
+        editor_id = dpg.add_node_editor(tag="node_editor")
+    return child_id, editor_id

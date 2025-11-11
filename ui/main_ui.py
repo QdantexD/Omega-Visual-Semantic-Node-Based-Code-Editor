@@ -5,10 +5,10 @@ import websockets
 from dearpygui import dearpygui as dpg
 
 from .windows.toolbar import build_toolbar
-from .windows.main_window import build_main_window
-from .windows.properties_panel import build_properties_panel
-from .windows.explorer_panel import build_explorer_panel
-from .windows.terminal_panel import build_terminal_panel
+from .windows.main_window import build_main_window, build_main_child
+from .windows.properties_panel import build_properties_panel, build_properties_child
+from .windows.explorer_panel import build_explorer_panel, build_explorer_sidebar
+from .windows.terminal_panel import build_terminal_panel, build_terminal_child
 from .core.graph import Graph
 from .core.nodes import Node, NodeType, NodeRegistry
 from .core.links import Link
@@ -36,19 +36,36 @@ _MINIMAP_WIN_ID = None
 _MINIMAP_DRAW_ID = None
 _SETTINGS = {"autosave": False, "wordWrap": "off"}
 
+# Paleta de estilo: negro elegante con acento verde neón
+ACCENT_GREEN = (57, 255, 20, 255)       # #39FF14
+ACCENT_GREEN_DIM = (57, 255, 20, 180)   # con alpha para bordes/hover
+BG_BLACK = (18, 18, 18, 255)            # fondo principal casi negro
+BG_PANEL = (24, 24, 24, 255)            # paneles ligeramente más claros
+TEXT_LIGHT = (230, 230, 230, 255)
+
 
 def _set_text(item, value):
-    dpg.set_value(item, value)
+    try:
+        if item and dpg.does_item_exist(item):
+            dpg.set_value(item, value)
+    except Exception:
+        pass
 
 
 def start_ui():
     dpg.create_context()
-    # Enable docking inside the viewport
+    # Habilitar docking y espacio de dock para una vista unificada
     try:
         dpg.configure_app(docking=True, docking_space=True)
     except Exception:
         pass
     dpg.create_viewport(title="Omega Visual Engine", width=1400, height=850)
+    # Intentar modo sin bordes y pantalla completa visual
+    try:
+        dpg.configure_viewport(decorated=False)
+        dpg.toggle_viewport_fullscreen()
+    except Exception:
+        pass
     dpg.setup_dearpygui()
 
     # Apply global visual theme
@@ -57,7 +74,7 @@ def start_ui():
         _font_set("Fira Code", size=14)
     except Exception:
         pass
-    # Root dockspace with menu bar as primary window
+    # Root dockspace con barra de menú superior (estable)
     with dpg.window(label="Omega Visual Engine", tag="root_dock", pos=(0, 0), width=1400, height=850, menubar=True, no_move=True, no_resize=True, no_close=True) as _ROOT_ID:
         with dpg.menu_bar():
             with dpg.menu(label="File"):
@@ -75,16 +92,16 @@ def start_ui():
                 dpg.add_menu_item(label="About", callback=lambda: _show_about())
     dpg.set_primary_window(_ROOT_ID, True)
 
-    # Build windows
+    # Construcción de ventanas clásicas (layout estático VS Code-like)
     toolbar_id = build_toolbar()
     main_win_id, editor_id = build_main_window()
     global _EDITOR_ID
     _EDITOR_ID = editor_id
-    # Side panels
-    explorer_id = build_explorer_panel()
+    with dpg.window(label="Explorer", width=280, height=700, pos=(0, 60), no_title_bar=True, no_move=True, no_resize=True) as explorer_win:
+        build_explorer_sidebar(explorer_win)
+    explorer_id = explorer_win
     props_id = build_properties_panel()
     terminal_id = build_terminal_panel()
-    # Store window ids for fullscreen toggle
     global _TOOLBAR_ID, _MAIN_WIN_ID, _PROPS_WIN_ID, _EXPLORER_ID, _TERMINAL_ID
     _TOOLBAR_ID = toolbar_id
     _MAIN_WIN_ID = main_win_id
@@ -92,48 +109,59 @@ def start_ui():
     _EXPLORER_ID = explorer_id
     _TERMINAL_ID = terminal_id
 
+    # Referencias ya configuradas por el layout clásico
+
+    # Hacer paneles estáticos: sin barra de título, sin movimiento
+    # La toolbar se integra en la barra de menú; no hay ventana separada
+    try:
+        dpg.configure_item(_EXPLORER_ID, no_title_bar=True, no_move=True)
+    except Exception:
+        pass
+    try:
+        dpg.configure_item(_MAIN_WIN_ID, no_title_bar=True, no_move=True)
+    except Exception:
+        pass
+    try:
+        dpg.configure_item(_TERMINAL_ID, no_title_bar=True, no_move=True)
+    except Exception:
+        pass
+    try:
+        dpg.configure_item(_PROPS_WIN_ID, no_title_bar=True, no_move=True)
+    except Exception:
+        pass
+
     # Apply per-window themes for panels
     try:
-        # Viewport central lighter gray #2A2A2A
+        # Viewport central: negro suave
         with dpg.theme() as _viewport_theme:
             with dpg.theme_component(dpg.mvAll):
-                dpg.add_theme_color(dpg.mvThemeCol_WindowBg, (42, 42, 42, 255))
-                dpg.add_theme_style(dpg.mvStyleVar_WindowRounding, 2.0)
+                dpg.add_theme_color(dpg.mvThemeCol_WindowBg, BG_PANEL)
+                dpg.add_theme_color(dpg.mvThemeCol_Border, ACCENT_GREEN_DIM)
+                dpg.add_theme_style(dpg.mvStyleVar_WindowRounding, 4.0)
                 dpg.add_theme_style(dpg.mvStyleVar_ItemSpacing, 8.0, 8.0)
         dpg.bind_item_theme(_MAIN_WIN_ID, _viewport_theme)
     except Exception:
         pass
 
-    # Status labels from toolbar: use alias directly
-    ws_label = _WS_STATUS_ALIAS
-    # Bottom status bar for logs
-    with dpg.window(label="Status", no_move=True, no_resize=True, height=28, pos=(0, 760), width=1200) as status_id:
-        log_label = dpg.add_text("Ready", wrap=0)
+    # Eliminar la barra de estado inferior: el estado de WS vive en la toolbar
+    # Mantener compatibilidad pasando log_label=None
+    log_label = None
     global _STATUS_WIN_ID
-    _STATUS_WIN_ID = status_id
+    _STATUS_WIN_ID = None
 
-    # Activity bar (estrecha, opcional)
-    with dpg.window(label="Activity", width=40, height=700, pos=(0, 60)) as act_id:
-        btn_e = dpg.add_button(label="E")
-        with dpg.tooltip(parent=btn_e):
-            dpg.add_text("Explorer")
-        btn_s = dpg.add_button(label="S")
-        with dpg.tooltip(parent=btn_s):
-            dpg.add_text("Search")
-        btn_g = dpg.add_button(label="G")
-        with dpg.tooltip(parent=btn_g):
-            dpg.add_text("Git")
-    global _ACTIVITYBAR_ID
-    _ACTIVITYBAR_ID = act_id
+    # Se elimina Activity bar estrecha: el Explorer ocupa la barra lateral
 
     # Register default node types
     _register_default_node_types()
 
-    # Wire toolbar actions
-    dpg.set_item_callback("btn_new", _on_new_pressed)
-    dpg.set_item_callback("btn_duplicate", _on_duplicate_pressed)
-    dpg.set_item_callback("btn_save", _on_save_pressed)
-    dpg.set_item_callback("btn_load", _on_load_pressed)
+    # Wire toolbar actions (si existen los elementos)
+    try:
+        dpg.set_item_callback("btn_new", _on_new_pressed)
+        dpg.set_item_callback("btn_duplicate", _on_duplicate_pressed)
+        dpg.set_item_callback("btn_save", _on_save_pressed)
+        dpg.set_item_callback("btn_load", _on_load_pressed)
+    except Exception:
+        pass
 
     # Configure node editor callbacks (link create/destroy)
     dpg.configure_item(editor_id, callback=_on_link_created, delink_callback=_on_link_deleted)
@@ -145,7 +173,7 @@ def start_ui():
         dpg.add_key_press_handler(dpg.mvKey_M, callback=_on_m_pressed)
 
     # Start WebSocket client thread
-    threading.Thread(target=_start_ws_client, args=(ws_label, log_label), daemon=True).start()
+    threading.Thread(target=_start_ws_client, args=(_WS_STATUS_ALIAS, log_label), daemon=True).start()
 
     # Minimap desactivado: no crear overlay ni reconstruirlo
 
@@ -216,22 +244,32 @@ def _build_global_theme():
     try:
         with dpg.theme() as theme_id:
             with dpg.theme_component(dpg.mvAll):
-                # Metallic dark theme
-                dpg.add_theme_color(dpg.mvThemeCol_WindowBg, (30, 30, 30, 255))  # #1E1E1E approx
-                dpg.add_theme_color(dpg.mvThemeCol_Text, (230, 230, 230, 255))   # #E6E6E6
-                dpg.add_theme_color(dpg.mvThemeCol_FrameBg, (45, 45, 45, 255))   # #2D2D2D
-                dpg.add_theme_color(dpg.mvThemeCol_FrameBgHovered, (55, 55, 55, 255))
-                dpg.add_theme_color(dpg.mvThemeCol_FrameBgActive, (58, 58, 58, 255))
-                # Accent buttons / active border
-                dpg.add_theme_color(dpg.mvThemeCol_Button, (0, 122, 204, 255))   # #007ACC
-                dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, (58, 155, 220, 255))  # #3A9BDC
-                dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, (0, 102, 184, 255))
-                dpg.add_theme_color(dpg.mvThemeCol_Border, (58, 155, 220, 200))
+                # Negro elegante + acento verde neón
+                dpg.add_theme_color(dpg.mvThemeCol_WindowBg, BG_BLACK)
+                dpg.add_theme_color(dpg.mvThemeCol_Text, TEXT_LIGHT)
+                dpg.add_theme_color(dpg.mvThemeCol_FrameBg, (28, 28, 28, 255))
+                dpg.add_theme_color(dpg.mvThemeCol_FrameBgHovered, (34, 34, 34, 255))
+                dpg.add_theme_color(dpg.mvThemeCol_FrameBgActive, (36, 36, 36, 255))
+                # Acento
+                dpg.add_theme_color(dpg.mvThemeCol_Button, ACCENT_GREEN)
+                dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, (80, 255, 80, 255))
+                dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, (40, 200, 40, 255))
+                dpg.add_theme_color(dpg.mvThemeCol_Border, ACCENT_GREEN_DIM)
+                dpg.add_theme_color(dpg.mvThemeCol_Header, (32, 32, 32, 255))
+                dpg.add_theme_color(dpg.mvThemeCol_HeaderHovered, ACCENT_GREEN_DIM)
+                dpg.add_theme_color(dpg.mvThemeCol_HeaderActive, ACCENT_GREEN)
+                # Tabs del editor (suaves, sin sobresaturar)
+                dpg.add_theme_color(dpg.mvThemeCol_Tab, (26, 26, 26, 255))
+                dpg.add_theme_color(dpg.mvThemeCol_TabHovered, (30, 30, 30, 255))
+                dpg.add_theme_color(dpg.mvThemeCol_TabActive, (32, 32, 32, 255))
                 # Spacing & rounding
-                dpg.add_theme_style(dpg.mvStyleVar_WindowRounding, 2.0)
-                dpg.add_theme_style(dpg.mvStyleVar_FrameRounding, 2.0)
+                dpg.add_theme_style(dpg.mvStyleVar_WindowRounding, 4.0)
+                dpg.add_theme_style(dpg.mvStyleVar_FrameRounding, 4.0)
                 dpg.add_theme_style(dpg.mvStyleVar_ItemSpacing, 8.0, 8.0)
                 dpg.add_theme_style(dpg.mvStyleVar_WindowPadding, 8.0, 8.0)
+                # Bordes sutiles para sensación nativa (sin tabs de docking)
+                dpg.add_theme_style(dpg.mvStyleVar_WindowBorderSize, 1.0)
+                dpg.add_theme_style(dpg.mvStyleVar_FrameBorderSize, 1.0)
         dpg.bind_theme(theme_id)
     except Exception as e:
         print("Theme build error:", e)
@@ -299,12 +337,14 @@ def _toggle_editor_fullscreen():
             _save_win(_TOOLBAR_ID, "toolbar")
             _save_win(_MAIN_WIN_ID, "main")
             _save_win(_PROPS_WIN_ID, "props")
-            _save_win(_STATUS_WIN_ID, "status")
+            if _STATUS_WIN_ID and dpg.does_item_exist(_STATUS_WIN_ID):
+                _save_win(_STATUS_WIN_ID, "status")
 
             # Hide ancillary windows
             dpg.configure_item(_TOOLBAR_ID, show=False)
             dpg.configure_item(_PROPS_WIN_ID, show=False)
-            dpg.configure_item(_STATUS_WIN_ID, show=False)
+            if _STATUS_WIN_ID and dpg.does_item_exist(_STATUS_WIN_ID):
+                dpg.configure_item(_STATUS_WIN_ID, show=False)
 
             # Maximize main window and editor
             vw, vh = _viewport_size()
@@ -333,7 +373,8 @@ def _toggle_editor_fullscreen():
             _restore(_TOOLBAR_ID, "toolbar")
             _restore(_MAIN_WIN_ID, "main")
             _restore(_PROPS_WIN_ID, "props")
-            _restore(_STATUS_WIN_ID, "status")
+            if _STATUS_WIN_ID and dpg.does_item_exist(_STATUS_WIN_ID):
+                _restore(_STATUS_WIN_ID, "status")
             _FS_MODE = False
     except Exception as e:
         print("Fullscreen toggle error:", e)
@@ -766,9 +807,15 @@ def _workspace_open(name: str):
 def _layout_apply_default():
     vw, vh = _viewport_size()
     toolbar_h = 60
-    status_h = 28
-    activity_w = 40
-    avail_w = max(0, vw - activity_w)
+    # Altura de status si existe, de lo contrario 0
+    status_h = 0
+    try:
+        if _STATUS_WIN_ID and dpg.does_item_exist(_STATUS_WIN_ID):
+            status_h = 28
+    except Exception:
+        pass
+    # Ancho disponible completo; el Explorer ocupa ~30% a la izquierda
+    avail_w = max(0, vw)
     avail_h = max(0, vh - toolbar_h - status_h)
 
     # Barra de herramientas y de estado
@@ -777,35 +824,33 @@ def _layout_apply_default():
     except Exception:
         pass
     try:
-        dpg.configure_item(_STATUS_WIN_ID, pos=(0, vh - status_h), width=vw, height=status_h)
+        if _STATUS_WIN_ID and dpg.does_item_exist(_STATUS_WIN_ID):
+            dpg.configure_item(_STATUS_WIN_ID, pos=(0, vh - status_h), width=vw, height=status_h)
     except Exception:
         pass
 
-    # Explorer izquierda 25% del ancho disponible
-    exp_w = int(avail_w * 0.25)
+    # Explorer izquierda 30% del ancho disponible
+    exp_w = int(avail_w * 0.30)
     exp_h = avail_h
-    dpg.configure_item(_EXPLORER_ID, pos=(activity_w, toolbar_h), width=exp_w, height=exp_h)
-
-    # Properties derecha 25% del ancho disponible
-    props_w = int(avail_w * 0.25)
-    dpg.configure_item(_PROPS_WIN_ID, pos=(activity_w + avail_w - props_w, toolbar_h), width=props_w, height=exp_h)
-
-    # Activity bar estrecha
-    dpg.configure_item(_ACTIVITYBAR_ID, pos=(0, toolbar_h), width=activity_w, height=exp_h)
+    dpg.configure_item(_EXPLORER_ID, pos=(0, toolbar_h), width=exp_w, height=exp_h)
 
     # Editor centro
-    main_x = activity_w + exp_w
-    main_w = avail_w - exp_w - props_w
-    main_h = int(exp_h * 0.7)
+    main_x = exp_w
+    main_w = avail_w - exp_w
+    # Área inferior compartida entre Output Log y Details: 30%
+    bottom_h = int(exp_h * 0.30)
+    main_h = exp_h - bottom_h
     dpg.configure_item(_MAIN_WIN_ID, pos=(main_x, toolbar_h), width=main_w, height=main_h)
     try:
         dpg.configure_item(_EDITOR_ID, width=main_w - 20, height=main_h - 20)
     except Exception:
         pass
 
-    # Terminal abajo 30%
-    term_h = exp_h - main_h
-    dpg.configure_item(_TERMINAL_ID, pos=(main_x, toolbar_h + main_h), width=main_w, height=term_h)
+    # Output Log abajo, izquierda 60% y Details abajo, derecha 40%
+    term_w = int(main_w * 0.60)
+    props_w = main_w - term_w
+    dpg.configure_item(_TERMINAL_ID, pos=(main_x, toolbar_h + main_h), width=term_w, height=bottom_h)
+    dpg.configure_item(_PROPS_WIN_ID, pos=(main_x + term_w, toolbar_h + main_h), width=props_w, height=bottom_h)
 
     # Minimapa desactivado: no centrar overlay
 
@@ -999,7 +1044,11 @@ def _font_set(name: str, size: int = 14):
 
 
 def _statusbar_show():
-    dpg.configure_item(_STATUS_WIN_ID, show=True)
+    try:
+        if _STATUS_WIN_ID and dpg.does_item_exist(_STATUS_WIN_ID):
+            dpg.configure_item(_STATUS_WIN_ID, show=True)
+    except Exception:
+        pass
 
 
 def _activitybar_hide():
@@ -1035,7 +1084,7 @@ def _ui_toggle(name: str):
 
 
 def _ui_show_all_panels():
-    for wid in (_EXPLORER_ID, _MAIN_WIN_ID, _TERMINAL_ID, _PROPS_WIN_ID, _ACTIVITYBAR_ID):
+    for wid in (_EXPLORER_ID, _MAIN_WIN_ID, _TERMINAL_ID, _PROPS_WIN_ID):
         try:
             dpg.configure_item(wid, show=True)
         except Exception:
